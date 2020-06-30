@@ -130,6 +130,9 @@ pub fn main() anyerror!void {
                     else => {},
                 }
             }
+        } else {
+            std.debug.print("No match found\n", .{});
+            try std.io.getStdOut().writeAll("\n");
         }
 
         arena.deinit();
