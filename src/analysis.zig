@@ -4,7 +4,7 @@ const ast = std.zig.ast;
 const types = @import("types.zig");
 
 /// Get a declaration's doc comment node
-fn getDocCommentNode(tree: *ast.Tree, node: *ast.Node) ?*ast.Node.DocComment {
+pub fn getDocCommentNode(tree: *ast.Tree, node: *ast.Node) ?*ast.Node.DocComment {
     if (node.cast(ast.Node.FnProto)) |func| {
         return func.doc_comments;
     } else if (node.cast(ast.Node.VarDecl)) |var_decl| {

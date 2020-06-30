@@ -108,7 +108,12 @@ pub fn main() anyerror!void {
                 const result_uri = result.handle.uri()[lib_uri.len.. ];
                 switch (result.type.data) {
                     .other => |n| {
-                        const start_loc = result.handle.tree.tokenLocation(0, n.firstToken());
+                        const start_tok = if (analysis.getDocCommentNode(result.handle.tree, n)) |doc_comment|
+                            doc_comment.first_line
+                        else
+                            n.firstToken();
+
+                        const start_loc = result.handle.tree.tokenLocation(0, start_tok);
                         const end_loc = result.handle.tree.tokenLocation(0, n.lastToken());
                         const github_uri = try std.fmt.allocPrint(&arena.allocator, "https://github.com/ziglang/zig/blob/master/lib{}#L{}-L{}\n", .{result_uri, start_loc.line + 1, end_loc.line + 1});
                         try std.io.getStdOut().writeAll(github_uri);
