@@ -84,7 +84,7 @@ pub fn main() anyerror!void {
     _ = args.skip();
     const lib_path = try args.next(gpa) orelse return error.NoLibPathProvided;
     defer gpa.free(lib_path);
-    const resolved_lib_path = try std.fs.path.resolve(&arena.allocator, &[_][]const u8{lib_path});
+    const resolved_lib_path = try std.fs.path.resolve(gpa, &[_][]const u8{lib_path});
     defer gpa.free(resolved_lib_path);
     std.debug.print("Library path: {}\n", .{resolved_lib_path});
     const lib_uri = try URI.fromPath(gpa, resolved_lib_path);
