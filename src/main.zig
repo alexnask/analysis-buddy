@@ -71,8 +71,6 @@ pub fn getFieldAccessType(
     return try analysis.resolveFieldAccessLhsType(store, arena, current_type, &bound_type_params);
 }
 
-const lib_path = "C:\\dev\\zig\\build-release\\lib\\zig";
-
 pub fn main() anyerror!void {
     const gpa = std.heap.page_allocator;
 
@@ -81,31 +79,41 @@ pub fn main() anyerror!void {
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
 
-    const lib_uri = try URI.fromPath(gpa, lib_path);
+    var args = try std.process.argsWithAllocator(&arena.allocator);
+    defer arena.deinit();
+
+    _ = args.skip();
+    const lib_path = try args.next(&arena.allocator) orelse return error.NoLibPathProvided;
+    const resolved_lib_path = try std.fs.path.resolve(&arena.allocator, &[_][]const u8{lib_path});
+    std.debug.print("Library path: {}\n", .{resolved_lib_path});
+    const lib_uri = try URI.fromPath(gpa, resolved_lib_path);
 
     var doc_store: DocumentStore = undefined;
     try doc_store.init(gpa, null, "", lib_path);
     defer doc_store.deinit();
 
-    const root_handle = try doc_store.openDocument(
-        "file://<ROOT>",
+    const root_handle = try doc_store.openDocument("file://<ROOT>",
         \\const std = @import("std");
     );
 
+    var timer = try std.time.Timer.start();
+
     while (true) {
-        const line = try reader.readUntilDelimiterAlloc(gpa, '\n', std.math.maxInt(usize));
+        const line = reader.readUntilDelimiterAlloc(gpa, '\n', std.math.maxInt(usize)) catch |e| switch (e) {
+            error.EndOfStream => break,
+            else => return e,
+        };
         defer gpa.free(line);
 
-        const start_time = std.time.milliTimestamp();
+        timer.reset();
         defer {
-            const end_time = std.time.milliTimestamp();
-            std.debug.print("Took {} ms to complete request.\n", .{end_time - start_time});
+            std.debug.print("Took {} ns to complete request.\n", .{timer.lap()});
         }
 
         var tokenizer = std.zig.Tokenizer.init(line);
         if (try getFieldAccessType(&doc_store, &arena, root_handle, &tokenizer)) |result| {
             if (result.handle != root_handle) {
-                const result_uri = result.handle.uri()[lib_uri.len.. ];
+                const result_uri = result.handle.uri()[lib_uri.len..];
                 switch (result.type.data) {
                     .other => |n| {
                         const start_tok = if (analysis.getDocCommentNode(result.handle.tree, n)) |doc_comment|
@@ -115,7 +123,7 @@ pub fn main() anyerror!void {
 
                         const start_loc = result.handle.tree.tokenLocation(0, start_tok);
                         const end_loc = result.handle.tree.tokenLocation(0, n.lastToken());
-                        const github_uri = try std.fmt.allocPrint(&arena.allocator, "https://github.com/ziglang/zig/blob/master/lib{}#L{}-L{}\n", .{result_uri, start_loc.line + 1, end_loc.line + 1});
+                        const github_uri = try std.fmt.allocPrint(&arena.allocator, "https://github.com/ziglang/zig/blob/master/lib{}#L{}-L{}\n", .{ result_uri, start_loc.line + 1, end_loc.line + 1 });
                         try std.io.getStdOut().writeAll(github_uri);
                     },
                     else => {},
