@@ -79,12 +79,13 @@ pub fn main() anyerror!void {
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
 
-    var args = try std.process.argsWithAllocator(&arena.allocator);
-    defer arena.deinit();
+    var args = try std.process.argsWithAllocator(gpa);
 
     _ = args.skip();
-    const lib_path = try args.next(&arena.allocator) orelse return error.NoLibPathProvided;
+    const lib_path = try args.next(gpa) orelse return error.NoLibPathProvided;
+    defer gpa.free(lib_path);
     const resolved_lib_path = try std.fs.path.resolve(&arena.allocator, &[_][]const u8{lib_path});
+    defer gpa.free(resolved_lib_path);
     std.debug.print("Library path: {}\n", .{resolved_lib_path});
     const lib_uri = try URI.fromPath(gpa, resolved_lib_path);
 
