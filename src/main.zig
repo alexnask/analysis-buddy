@@ -74,9 +74,9 @@ pub fn getFieldAccessType(
     }
 
     return result;
-
-    // return try analysis.resolveFieldAccessLhsType(store, arena, current_type, &bound_type_params);
 }
+
+const cache_reload_command = ":reload-cached:";
 
 pub fn main() anyerror!void {
     const gpa = std.heap.page_allocator;
@@ -121,6 +121,37 @@ pub fn main() anyerror!void {
         timer.reset();
         defer {
             std.debug.print("Took {} ns to complete request.\n", .{timer.lap()});
+        }
+
+        const trimmed_line = std.mem.trim(u8, line, "\n \t\r");
+        if (trimmed_line.len == cache_reload_command.len and std.mem.eql(u8, trimmed_line, cache_reload_command)) {
+            var reloaded: usize = 0;
+            var it = doc_store.handles.iterator();
+            while (it.next()) |entry| {
+                if (entry.value == root_handle) {
+                    continue;
+                }
+
+                // This was constructed from a path, it will never fail.
+                const path = URI.parse(&arena.allocator, entry.key) catch |err| switch(err) {
+                    error.OutOfMemory => return err,
+                    else => unreachable,
+                };
+
+                const new_text = try std.fs.cwd().readFileAlloc(gpa, path, std.math.maxInt(usize));
+                // Completely replace the whole text of the document
+                gpa.free(entry.value.document.mem);
+                entry.value.document.mem = new_text;
+                entry.value.document.text = new_text;
+                entry.value.tree.deinit();
+                entry.value.tree = try std.zig.parse(gpa, new_text);
+                entry.value.document_scope.deinit(gpa);
+                entry.value.document_scope = try analysis.makeDocumentScope(gpa, entry.value.tree);
+
+                reloaded += 1;
+            }
+            std.debug.print("Realoded {} of {} cached documents.\n", .{reloaded, doc_store.handles.count() - 1});
+            continue;
         }
 
         var bound_type_params = analysis.BoundTypeParams.init(&arena.allocator);

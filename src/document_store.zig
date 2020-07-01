@@ -382,7 +382,7 @@ pub fn getHandle(self: *DocumentStore, uri: []const u8) ?*Handle {
 }
 
 // Check if the document text is now sane, move it to sane_text if so.
-fn refreshDocument(self: *DocumentStore, handle: *Handle, zig_lib_path: ?[]const u8) !void {
+pub fn refreshDocument(self: *DocumentStore, handle: *Handle, zig_lib_path: ?[]const u8) !void {
     std.log.debug(.doc_store, "New text for document {}\n", .{handle.uri()});
     handle.tree.deinit();
     handle.tree = try std.zig.parse(self.allocator, handle.document.text);
