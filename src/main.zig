@@ -16,9 +16,12 @@ pub fn getFieldAccessType(
         .handle = handle,
     });
 
+    var result: ?analysis.DeclWithHandle = null;
+
     while (true) {
         const tok = tokenizer.next();
         switch (tok.id) {
+            .Eof => return result,
             .Identifier => {
                 if (try analysis.lookupSymbolGlobal(store, arena, current_type.handle, tokenizer.buffer[tok.loc.start..tok.loc.end], 0)) |child| {
                     current_type = (try child.resolveType(store, arena, bound_type_params)) orelse return null;
@@ -27,10 +30,12 @@ pub fn getFieldAccessType(
             .Period => {
                 const after_period = tokenizer.next();
                 switch (after_period.id) {
+                    .Eof => return result,
                     .Identifier => {
+                        if (result) |child| {
+                            current_type = (try child.resolveType(store, arena, bound_type_params)) orelse return null;
+                        }
                         current_type = try analysis.resolveFieldAccessLhsType(store, arena, current_type, bound_type_params);
-
-                        const last_ident = tokenizer.buffer.len == after_period.loc.end;
 
                         var current_type_node = switch (current_type.type.data) {
                             .other => |n| n,
@@ -54,11 +59,7 @@ pub fn getFieldAccessType(
                             tokenizer.buffer[after_period.loc.start..after_period.loc.end],
                             !current_type.type.is_type_val,
                         )) |child| {
-                            if (last_ident) {
-                                return child;
-                            }
-
-                            current_type = (try child.resolveType(store, arena, bound_type_params)) orelse return null;
+                            result = child;
                         } else return null;
                     },
                     else => {
@@ -72,7 +73,7 @@ pub fn getFieldAccessType(
         }
     }
 
-    return null;
+    return result;
 
     // return try analysis.resolveFieldAccessLhsType(store, arena, current_type, &bound_type_params);
 }
@@ -123,7 +124,7 @@ pub fn main() anyerror!void {
         }
 
         var bound_type_params = analysis.BoundTypeParams.init(&arena.allocator);
-        var tokenizer = std.zig.Tokenizer.init(line[0..line.len-1]);
+        var tokenizer = std.zig.Tokenizer.init(std.mem.trim(u8, line, "\n \t"));
         if (try getFieldAccessType(&doc_store, &arena, root_handle, &tokenizer, &bound_type_params)) |result| {
             if (result.handle != root_handle) {
                 switch (result.decl.*) {
