@@ -18,11 +18,13 @@ pub const Object = json.ObjectMap;
 pub const DocumentUri = String;
 
 pub const Position = struct {
-    line: Integer, character: Integer,
+    line: Integer,
+    character: Integer,
 };
 
 pub const Range = struct {
-    start: Position, end: Position,
+    start: Position,
+    end: Position,
 };
 
 pub const Location = struct {
@@ -56,6 +58,7 @@ pub const ResponseParams = union(enum) {
     DocumentSymbols: []DocumentSymbol,
     SemanticTokens: struct { data: []const u32 },
     TextEdits: []TextEdit,
+    Locations: []Location,
     WorkspaceEdit: WorkspaceEdit,
 };
 
@@ -94,7 +97,7 @@ pub const MessageType = enum(Integer) {
     pub fn jsonStringify(
         value: MessageType,
         options: json.StringifyOptions,
-        out_stream: var,
+        out_stream: anytype,
     ) !void {
         try json.stringify(@enumToInt(value), options, out_stream);
     }
@@ -114,7 +117,7 @@ pub const DiagnosticSeverity = enum(Integer) {
     pub fn jsonStringify(
         value: DiagnosticSeverity,
         options: json.StringifyOptions,
-        out_stream: var,
+        out_stream: anytype,
     ) !void {
         try json.stringify(@enumToInt(value), options, out_stream);
     }
@@ -138,56 +141,6 @@ pub const TextDocument = struct {
     text: String,
     // This holds the memory that we have actually allocated.
     mem: []u8,
-
-    pub fn positionToIndex(self: TextDocument, position: Position) !usize {
-        var split_iterator = std.mem.split(self.text, "\n");
-
-        var line: i64 = 0;
-        while (line < position.line) : (line += 1) {
-            _ = split_iterator.next() orelse return error.InvalidParams;
-        }
-
-        var index = @intCast(i64, split_iterator.index.?) + position.character;
-
-        if (index < 0 or index >= @intCast(i64, self.text.len)) {
-            return error.InvalidParams;
-        }
-
-        return @intCast(usize, index);
-    }
-
-    pub fn getLine(self: TextDocument, target_line: usize) ![]const u8 {
-        var split_iterator = std.mem.split(self.text, "\n");
-
-        var line: i64 = 0;
-        while (line < target_line) : (line += 1) {
-            _ = split_iterator.next() orelse return error.InvalidParams;
-        }
-        if (split_iterator.next()) |next| {
-            return next;
-        } else return error.InvalidParams;
-    }
-
-    pub fn range(self: TextDocument) Range {
-        var line_idx: i64 = 0;
-        var curr_line: []const u8 = self.text;
-
-        var split_iterator = std.mem.split(self.text, "\n");
-        while (split_iterator.next()) |line| : (line_idx += 1) {
-            curr_line = line;
-        }
-
-        return .{
-            .start = .{
-                .line = 0,
-                .character = 0,
-            },
-            .end = .{
-                .line = line_idx,
-                .character = @intCast(i64, curr_line.len),
-            },
-        };
-    }
 };
 
 pub const WorkspaceEdit = struct {
@@ -196,7 +149,7 @@ pub const WorkspaceEdit = struct {
     pub fn jsonStringify(
         self: WorkspaceEdit,
         options: std.json.StringifyOptions,
-        writer: var,
+        writer: anytype,
     ) @TypeOf(writer).Error!void {
         try writer.writeByte('{');
         if (self.changes) |changes| {
@@ -229,7 +182,7 @@ pub const MarkupKind = enum(u1) {
     pub fn jsonStringify(
         value: MarkupKind,
         options: json.StringifyOptions,
-        out_stream: var,
+        out_stream: anytype,
     ) !void {
         const str = switch (value) {
             .PlainText => "plaintext",
@@ -296,7 +249,7 @@ pub const CompletionItemKind = enum(Integer) {
     pub fn jsonStringify(
         value: CompletionItemKind,
         options: json.StringifyOptions,
-        out_stream: var,
+        out_stream: anytype,
     ) !void {
         try json.stringify(@enumToInt(value), options, out_stream);
     }
@@ -309,14 +262,21 @@ pub const InsertTextFormat = enum(Integer) {
     pub fn jsonStringify(
         value: InsertTextFormat,
         options: json.StringifyOptions,
-        out_stream: var,
+        out_stream: anytype,
     ) !void {
         try json.stringify(@enumToInt(value), options, out_stream);
     }
 };
 
 pub const CompletionItem = struct {
-    label: String, kind: CompletionItemKind, textEdit: ?TextEdit = null, filterText: ?String = null, insertText: ?String = null, insertTextFormat: ?InsertTextFormat = InsertTextFormat.PlainText, detail: ?String = null, documentation: ?MarkupContent = null
+    label: String,
+    kind: CompletionItemKind,
+    textEdit: ?TextEdit = null,
+    filterText: ?String = null,
+    insertText: ?String = null,
+    insertTextFormat: ?InsertTextFormat = InsertTextFormat.PlainText,
+    detail: ?String = null,
+    documentation: ?MarkupContent = null,
     // filterText: String = .NotDefined,
 };
 
@@ -351,7 +311,7 @@ const SymbolKind = enum {
     pub fn jsonStringify(
         value: SymbolKind,
         options: json.StringifyOptions,
-        out_stream: var,
+        out_stream: anytype,
     ) !void {
         try json.stringify(@enumToInt(value), options, out_stream);
     }
@@ -364,7 +324,7 @@ pub const DocumentSymbol = struct {
     deprecated: bool = false,
     range: Range,
     selectionRange: Range,
-    children: []DocumentSymbol = &[_]DocumentSymbol{},
+    children: []const DocumentSymbol = &[_]DocumentSymbol{},
 };
 
 pub const ShowMessageParams = struct {
