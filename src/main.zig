@@ -3,6 +3,18 @@ const analysis = @import("analysis.zig");
 const DocumentStore = @import("document_store.zig");
 const URI = @import("uri.zig");
 const ast = std.zig.ast;
+const builtins = @import("builtins.zig");
+
+const builtin_names = block: {
+    @setEvalBranchQuota(6_500);
+    var names: [builtins.builtins.len]struct{ @"0": []const u8 } = undefined;
+    for (builtins.builtins) |builtin, i| {
+        const cutoff = std.mem.indexOf(u8, builtin, "(") orelse builtin.len;
+        names[i] = .{ .@"0" = builtin[0..cutoff] };
+        // names.tuple = names.tuple ++ .{.{builtin[0..cutoff]}};
+    }
+    break :block std.ComptimeStringMap(void, names);
+};
 
 pub fn getFieldAccessType(
     store: *DocumentStore,
@@ -42,7 +54,7 @@ pub fn getFieldAccessType(
                             else => return null,
                         };
 
-                        if (current_type_node.cast(ast.Node.FnProto)) |func| {
+                        if (current_type_node.castTag(.FnProto)) |func| {
                             if (try analysis.resolveReturnType(store, arena, func, current_type.handle, bound_type_params)) |ret| {
                                 current_type = ret;
                                 current_type_node = switch (current_type.type.data) {
@@ -133,7 +145,7 @@ pub fn main() anyerror!void {
                 }
 
                 // This was constructed from a path, it will never fail.
-                const path = URI.parse(&arena.allocator, entry.key) catch |err| switch(err) {
+                const path = URI.parse(&arena.allocator, entry.key) catch |err| switch (err) {
                     error.OutOfMemory => return err,
                     else => unreachable,
                 };
@@ -150,7 +162,14 @@ pub fn main() anyerror!void {
 
                 reloaded += 1;
             }
-            std.debug.print("Realoded {} of {} cached documents.\n", .{reloaded, doc_store.handles.count() - 1});
+            std.debug.print("Realoded {} of {} cached documents.\n", .{ reloaded, doc_store.handles.count() - 1 });
+            continue;
+        }
+
+        if (trimmed_line[0] == '@') {
+            if (builtin_names.has(trimmed_line)) {
+                try std.io.getStdOut().writer().print("https://ziglang.org/documentation/master/#{}\n", .{trimmed_line[1..]});
+            }
             continue;
         }
 
@@ -170,9 +189,9 @@ pub fn main() anyerror!void {
                                 },
                                 else => {},
                             }
-                        } else if (node.cast(ast.Node.VarDecl)) |vdecl| try_import_resolve: {
-                            if (vdecl.init_node) |init| {
-                                if (init.cast(ast.Node.BuiltinCall)) |builtin| {
+                        } else if (node.castTag(.VarDecl)) |vdecl| try_import_resolve: {
+                            if (vdecl.getTrailer("init_node")) |init| {
+                                if (init.castTag(.BuiltinCall)) |builtin| {
                                     if (std.mem.eql(u8, handle.tree.tokenSlice(builtin.builtin_token), "@import") and builtin.params_len == 1) {
                                         const import_type = (try result.resolveType(&doc_store, &arena, &bound_type_params)) orelse break :try_import_resolve;
                                         switch (import_type.type.data) {
