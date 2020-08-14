@@ -7,7 +7,7 @@ const builtins = @import("builtins.zig");
 
 const builtin_names = block: {
     @setEvalBranchQuota(6_500);
-    var names: [builtins.builtins.len]struct{ @"0": []const u8 } = undefined;
+    var names: [builtins.builtins.len]struct { @"0": []const u8 } = undefined;
     for (builtins.builtins) |builtin, i| {
         const cutoff = std.mem.indexOf(u8, builtin, "(") orelse builtin.len;
         names[i] = .{ .@"0" = builtin[0..cutoff] };
@@ -89,6 +89,119 @@ pub fn getFieldAccessType(
 
 const cache_reload_command = ":reload-cached:";
 
+const PrepareResult = struct {
+    store: DocumentStore,
+    root_handle: *DocumentStore.Handle,
+};
+
+pub fn prepare(gpa: *std.mem.Allocator, std_lib_path: []const u8) !PrepareResult {
+    const resolved_lib_path = try std.fs.path.resolve(gpa, &[_][]const u8{std_lib_path});
+    errdefer gpa.free(resolved_lib_path);
+    std.debug.print("Library path: {}\n", .{resolved_lib_path});
+    const lib_uri = try URI.fromPath(gpa, resolved_lib_path);
+
+    var result: PrepareResult = undefined;
+    try result.store.init(gpa, null, "", std_lib_path);
+    errdefer result.store.deinit();
+
+    result.root_handle = try result.store.openDocument("file://<ROOT>",
+        \\const std = @import("std");
+    );
+    return result;
+}
+
+pub fn reloadCached(arena: *std.heap.ArenaAllocator, gpa: *std.mem.Allocator, prepared: *PrepareResult) !void {
+    var reloaded: usize = 0;
+    var it = prepared.store.handles.iterator();
+    while (it.next()) |entry| {
+        if (entry.value == prepared.root_handle) {
+            continue;
+        }
+
+        // This was constructed from a path, it will never fail.
+        const path = URI.parse(&arena.allocator, entry.key) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => unreachable,
+        };
+
+        const new_text = try std.fs.cwd().readFileAlloc(gpa, path, std.math.maxInt(usize));
+        // Completely replace the whole text of the document
+        gpa.free(entry.value.document.mem);
+        entry.value.document.mem = new_text;
+        entry.value.document.text = new_text;
+        entry.value.tree.deinit();
+        entry.value.tree = try std.zig.parse(gpa, new_text);
+        entry.value.document_scope.deinit(gpa);
+        entry.value.document_scope = try analysis.makeDocumentScope(gpa, entry.value.tree);
+
+        reloaded += 1;
+    }
+    std.debug.print("Realoded {} of {} cached documents.\n", .{ reloaded, prepared.store.handles.count() - 1 });
+}
+
+pub fn dispose(prepared: *PrepareResult) void {
+    prepared.store.deinit();
+}
+
+pub fn analyse(arena: *std.heap.ArenaAllocator, prepared: *PrepareResult, line: []const u8, lib_uri: []const u8) !?[]const u8 {
+    if (line[0] == '@') {
+        if (builtin_names.has(line)) {
+            return try std.fmt.allocPrint(&arena.allocator, "https://ziglang.org/documentation/master/#{}", .{line[1..]});
+        }
+        return null;
+    }
+
+    var bound_type_params = analysis.BoundTypeParams.init(&arena.allocator);
+    var tokenizer = std.zig.Tokenizer.init(std.mem.trim(u8, line, "\n \t"));
+    if (try getFieldAccessType(&prepared.store, arena, prepared.root_handle, &tokenizer, &bound_type_params)) |result| {
+        if (result.handle != prepared.root_handle) {
+            switch (result.decl.*) {
+                .ast_node => |n| {
+                    var handle = result.handle;
+                    var node = n;
+                    if (try analysis.resolveVarDeclAlias(&prepared.store, arena, .{ .node = node, .handle = result.handle })) |alias_result| {
+                        switch (alias_result.decl.*) {
+                            .ast_node => |inner| {
+                                handle = alias_result.handle;
+                                node = inner;
+                            },
+                            else => {},
+                        }
+                    } else if (node.castTag(.VarDecl)) |vdecl| try_import_resolve: {
+                        if (vdecl.getTrailer("init_node")) |init| {
+                            if (init.castTag(.BuiltinCall)) |builtin| {
+                                if (std.mem.eql(u8, handle.tree.tokenSlice(builtin.builtin_token), "@import") and builtin.params_len == 1) {
+                                    const import_type = (try result.resolveType(&prepared.store, arena, &bound_type_params)) orelse break :try_import_resolve;
+                                    switch (import_type.type.data) {
+                                        .other => |resolved_node| {
+                                            handle = import_type.handle;
+                                            node = resolved_node;
+                                        },
+                                        else => {},
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    const start_tok = if (analysis.getDocCommentNode(handle.tree, node)) |doc_comment|
+                        doc_comment.first_line
+                    else
+                        node.firstToken();
+
+                    const result_uri = handle.uri()[lib_uri.len..];
+
+                    const start_loc = handle.tree.tokenLocation(0, start_tok);
+                    const end_loc = handle.tree.tokenLocation(0, node.lastToken());
+
+                    return try std.fmt.allocPrint(&arena.allocator, "https://github.com/ziglang/zig/blob/master/lib{}#L{}-L{}\n", .{ result_uri, start_loc.line + 1, end_loc.line + 1 });
+                },
+                else => {},
+            }
+        }
+    }
+    return null;
+}
+
 pub fn main() anyerror!void {
     const gpa = std.heap.page_allocator;
 
@@ -97,23 +210,13 @@ pub fn main() anyerror!void {
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
 
-    var args = try std.process.argsWithAllocator(gpa);
-
+    var args = std.process.args();
     _ = args.skip();
     const lib_path = try args.next(gpa) orelse return error.NoLibPathProvided;
     defer gpa.free(lib_path);
-    const resolved_lib_path = try std.fs.path.resolve(gpa, &[_][]const u8{lib_path});
-    defer gpa.free(resolved_lib_path);
-    std.debug.print("Library path: {}\n", .{resolved_lib_path});
-    const lib_uri = try URI.fromPath(gpa, resolved_lib_path);
 
-    var doc_store: DocumentStore = undefined;
-    try doc_store.init(gpa, null, "", lib_path);
-    defer doc_store.deinit();
-
-    const root_handle = try doc_store.openDocument("file://<ROOT>",
-        \\const std = @import("std");
-    );
+    var prepared = try prepare(gpa, lib_path);
+    defer dispose(&prepared);
 
     var timer = try std.time.Timer.start();
 
@@ -136,92 +239,16 @@ pub fn main() anyerror!void {
 
         const trimmed_line = std.mem.trim(u8, line, "\n \t\r");
         if (trimmed_line.len == cache_reload_command.len and std.mem.eql(u8, trimmed_line, cache_reload_command)) {
-            var reloaded: usize = 0;
-            var it = doc_store.handles.iterator();
-            while (it.next()) |entry| {
-                if (entry.value == root_handle) {
-                    continue;
-                }
-
-                // This was constructed from a path, it will never fail.
-                const path = URI.parse(&arena.allocator, entry.key) catch |err| switch (err) {
-                    error.OutOfMemory => return err,
-                    else => unreachable,
-                };
-
-                const new_text = try std.fs.cwd().readFileAlloc(gpa, path, std.math.maxInt(usize));
-                // Completely replace the whole text of the document
-                gpa.free(entry.value.document.mem);
-                entry.value.document.mem = new_text;
-                entry.value.document.text = new_text;
-                entry.value.tree.deinit();
-                entry.value.tree = try std.zig.parse(gpa, new_text);
-                entry.value.document_scope.deinit(gpa);
-                entry.value.document_scope = try analysis.makeDocumentScope(gpa, entry.value.tree);
-
-                reloaded += 1;
-            }
-            std.debug.print("Realoded {} of {} cached documents.\n", .{ reloaded, doc_store.handles.count() - 1 });
+            try reloadCached(&arena, gpa, &prepared);
             continue;
         }
 
-        if (trimmed_line[0] == '@') {
-            if (builtin_names.has(trimmed_line)) {
-                try std.io.getStdOut().writer().print("https://ziglang.org/documentation/master/#{}\n", .{trimmed_line[1..]});
-            }
-            continue;
+        if (try analyse(&arena, &prepared, trimmed_line, lib_path)) |match| {
+            try std.io.getStdOut().writeAll("Match: ");
+            try std.io.getStdOut().writeAll(match);
+            try std.io.getStdOut().writer().writeByte('\n');
+        } else {
+            try std.io.getStdOut().writeAll("No match found.\n");
         }
-
-        var bound_type_params = analysis.BoundTypeParams.init(&arena.allocator);
-        var tokenizer = std.zig.Tokenizer.init(std.mem.trim(u8, line, "\n \t"));
-        if (try getFieldAccessType(&doc_store, &arena, root_handle, &tokenizer, &bound_type_params)) |result| {
-            if (result.handle != root_handle) {
-                switch (result.decl.*) {
-                    .ast_node => |n| {
-                        var handle = result.handle;
-                        var node = n;
-                        if (try analysis.resolveVarDeclAlias(&doc_store, &arena, .{ .node = node, .handle = result.handle })) |alias_result| {
-                            switch (alias_result.decl.*) {
-                                .ast_node => |inner| {
-                                    handle = alias_result.handle;
-                                    node = inner;
-                                },
-                                else => {},
-                            }
-                        } else if (node.castTag(.VarDecl)) |vdecl| try_import_resolve: {
-                            if (vdecl.getTrailer("init_node")) |init| {
-                                if (init.castTag(.BuiltinCall)) |builtin| {
-                                    if (std.mem.eql(u8, handle.tree.tokenSlice(builtin.builtin_token), "@import") and builtin.params_len == 1) {
-                                        const import_type = (try result.resolveType(&doc_store, &arena, &bound_type_params)) orelse break :try_import_resolve;
-                                        switch (import_type.type.data) {
-                                            .other => |resolved_node| {
-                                                handle = import_type.handle;
-                                                node = resolved_node;
-                                            },
-                                            else => {},
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        const start_tok = if (analysis.getDocCommentNode(handle.tree, node)) |doc_comment|
-                            doc_comment.first_line
-                        else
-                            node.firstToken();
-
-                        const result_uri = handle.uri()[lib_uri.len..];
-
-                        const start_loc = handle.tree.tokenLocation(0, start_tok);
-                        const end_loc = handle.tree.tokenLocation(0, node.lastToken());
-                        const github_uri = try std.fmt.allocPrint(&arena.allocator, "https://github.com/ziglang/zig/blob/master/lib{}#L{}-L{}\n", .{ result_uri, start_loc.line + 1, end_loc.line + 1 });
-                        try std.io.getStdOut().writeAll(github_uri);
-                        continue;
-                    },
-                    else => {},
-                }
-            }
-        }
-        std.debug.print("No match found\n", .{});
-        try std.io.getStdOut().writeAll("\n");
     }
 }
