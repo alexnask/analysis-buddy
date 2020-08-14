@@ -11,7 +11,6 @@ const builtin_names = block: {
     for (builtins.builtins) |builtin, i| {
         const cutoff = std.mem.indexOf(u8, builtin, "(") orelse builtin.len;
         names[i] = .{ .@"0" = builtin[0..cutoff] };
-        // names.tuple = names.tuple ++ .{.{builtin[0..cutoff]}};
     }
     break :block std.ComptimeStringMap(void, names);
 };
