@@ -68,7 +68,7 @@ pub fn getFieldAccessType(
                             arena,
                             .{ .node = current_type_node, .handle = current_type.handle },
                             tokenizer.buffer[after_period.loc.start..after_period.loc.end],
-                            !current_type.type.is_type_val,
+                            true,
                         )) |child| {
                             result = child;
                         } else return null;
@@ -92,17 +92,24 @@ const cache_reload_command = ":reload-cached:";
 const PrepareResult = struct {
     store: DocumentStore,
     root_handle: *DocumentStore.Handle,
+    lib_uri: []const u8,
+
+    pub fn deinit(self: *PrepareResult) void {
+        self.store.allocator.free(self.lib_uri);
+    }
 };
 
 pub fn prepare(gpa: *std.mem.Allocator, std_lib_path: []const u8) !PrepareResult {
     const resolved_lib_path = try std.fs.path.resolve(gpa, &[_][]const u8{std_lib_path});
     errdefer gpa.free(resolved_lib_path);
     std.debug.print("Library path: {}\n", .{resolved_lib_path});
-    const lib_uri = try URI.fromPath(gpa, resolved_lib_path);
 
     var result: PrepareResult = undefined;
     try result.store.init(gpa, null, "", std_lib_path);
     errdefer result.store.deinit();
+
+    result.lib_uri = try URI.fromPath(gpa, resolved_lib_path);
+    errdefer gpa.free(result.lib_uri);
 
     result.root_handle = try result.store.openDocument("file://<ROOT>",
         \\const std = @import("std");
@@ -143,7 +150,7 @@ pub fn dispose(prepared: *PrepareResult) void {
     prepared.store.deinit();
 }
 
-pub fn analyse(arena: *std.heap.ArenaAllocator, prepared: *PrepareResult, line: []const u8, lib_uri: []const u8) !?[]const u8 {
+pub fn analyse(arena: *std.heap.ArenaAllocator, prepared: *PrepareResult, line: []const u8) !?[]const u8 {
     if (line[0] == '@') {
         if (builtin_names.has(line)) {
             return try std.fmt.allocPrint(&arena.allocator, "https://ziglang.org/documentation/master/#{}", .{line[1..]});
@@ -188,8 +195,7 @@ pub fn analyse(arena: *std.heap.ArenaAllocator, prepared: *PrepareResult, line: 
                     else
                         node.firstToken();
 
-                    const result_uri = handle.uri()[lib_uri.len..];
-
+                    const result_uri = handle.uri()[prepared.lib_uri.len..];
                     const start_loc = handle.tree.tokenLocation(0, start_tok);
                     const end_loc = handle.tree.tokenLocation(0, node.lastToken());
 
@@ -243,7 +249,7 @@ pub fn main() anyerror!void {
             continue;
         }
 
-        if (try analyse(&arena, &prepared, trimmed_line, lib_path)) |match| {
+        if (try analyse(&arena, &prepared, trimmed_line)) |match| {
             try std.io.getStdOut().writeAll("Match: ");
             try std.io.getStdOut().writeAll(match);
             try std.io.getStdOut().writer().writeByte('\n');
