@@ -89,7 +89,7 @@ pub fn getFieldAccessType(
 
 const cache_reload_command = ":reload-cached:";
 
-const PrepareResult = struct {
+pub const PrepareResult = struct {
     store: DocumentStore,
     root_handle: *DocumentStore.Handle,
     lib_uri: []const u8,
