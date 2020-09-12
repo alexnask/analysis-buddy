@@ -175,7 +175,7 @@ pub fn analyse(arena: *std.heap.ArenaAllocator, prepared: *PrepareResult, line: 
                             else => {},
                         }
                     } else if (node.castTag(.VarDecl)) |vdecl| try_import_resolve: {
-                        if (vdecl.getTrailer("init_node")) |init| {
+                        if (vdecl.getInitNode()) |init| {
                             if (init.castTag(.BuiltinCall)) |builtin| {
                                 if (std.mem.eql(u8, handle.tree.tokenSlice(builtin.builtin_token), "@import") and builtin.params_len == 1) {
                                     const import_type = (try result.resolveType(&prepared.store, arena, &bound_type_params)) orelse break :try_import_resolve;
