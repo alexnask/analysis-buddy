@@ -5,16 +5,6 @@ const URI = @import("uri.zig");
 const ast = std.zig.ast;
 const builtins = @import("builtins.zig");
 
-const builtin_names = block: {
-    @setEvalBranchQuota(6_500);
-    var names: [builtins.builtins.len]struct { @"0": []const u8 } = undefined;
-    for (builtins.builtins) |builtin, i| {
-        const cutoff = std.mem.indexOf(u8, builtin, "(") orelse builtin.len;
-        names[i] = .{ .@"0" = builtin[0..cutoff] };
-    }
-    break :block std.ComptimeStringMap(void, names);
-};
-
 pub fn getFieldAccessType(
     store: *DocumentStore,
     arena: *std.heap.ArenaAllocator,
@@ -152,8 +142,10 @@ pub fn dispose(prepared: *PrepareResult) void {
 
 pub fn analyse(arena: *std.heap.ArenaAllocator, prepared: *PrepareResult, line: []const u8) !?[]const u8 {
     if (line[0] == '@') {
-        if (builtin_names.has(line)) {
-            return try std.fmt.allocPrint(&arena.allocator, "https://ziglang.org/documentation/master/#{}", .{line[1..]});
+        for (builtins.builtins) |builtin| {
+            if (std.mem.eql(u8, builtin.name, line)) {
+                return try std.fmt.allocPrint(&arena.allocator, "https://ziglang.org/documentation/master/#{}", .{line[1..]});
+            }
         }
         return null;
     }

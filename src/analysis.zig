@@ -29,7 +29,7 @@ pub fn getDocComments(
     allocator: *std.mem.Allocator,
     tree: *ast.Tree,
     node: *ast.Node,
-    format: types.MarkupKind,
+    format: types.MarkupContent.Kind,
 ) !?[]const u8 {
     if (getDocCommentNode(tree, node)) |doc_comment_node| {
         return try collectDocComments(allocator, tree, doc_comment_node, format);
@@ -41,7 +41,7 @@ pub fn collectDocComments(
     allocator: *std.mem.Allocator,
     tree: *ast.Tree,
     doc_comments: *ast.Node.DocComment,
-    format: types.MarkupKind,
+    format: types.MarkupContent.Kind,
 ) ![]const u8 {
     var lines = std.ArrayList([]const u8).init(allocator);
     defer lines.deinit();
@@ -51,7 +51,7 @@ pub fn collectDocComments(
         switch (tree.token_ids[curr_line_tok]) {
             .LineComment => continue,
             .DocComment, .ContainerDocComment => {
-                try lines.append(std.fmt.trim(tree.tokenSlice(curr_line_tok)[3..]));
+                try lines.append(std.mem.trim(u8, tree.tokenSlice(curr_line_tok)[3..], &std.ascii.spaces));
             },
             else => break,
         }
@@ -912,6 +912,10 @@ pub const TypeWithHandle = struct {
 
     pub fn isUnionType(self: TypeWithHandle) bool {
         return self.isContainer(.Keyword_union);
+    }
+
+    pub fn isOpaqueType(self: TypeWithHandle) bool {
+        return self.isContainer(.Keyword_opaque);
     }
 
     pub fn isTypeFunc(self: TypeWithHandle) bool {
