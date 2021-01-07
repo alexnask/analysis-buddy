@@ -92,7 +92,7 @@ pub const PrepareResult = struct {
 pub fn prepare(gpa: *std.mem.Allocator, std_lib_path: []const u8) !PrepareResult {
     const resolved_lib_path = try std.fs.path.resolve(gpa, &[_][]const u8{std_lib_path});
     errdefer gpa.free(resolved_lib_path);
-    std.debug.print("Library path: {}\n", .{resolved_lib_path});
+    std.debug.print("Library path: {s}\n", .{resolved_lib_path});
 
     var result: PrepareResult = undefined;
     try result.store.init(gpa, null, "", std_lib_path);
@@ -133,7 +133,7 @@ pub fn reloadCached(arena: *std.heap.ArenaAllocator, gpa: *std.mem.Allocator, pr
 
         reloaded += 1;
     }
-    std.debug.print("Realoded {} of {} cached documents.\n", .{ reloaded, prepared.store.handles.count() - 1 });
+    std.debug.print("Realoded {d} of {d} cached documents.\n", .{ reloaded, prepared.store.handles.count() - 1 });
 }
 
 pub fn dispose(prepared: *PrepareResult) void {
@@ -144,7 +144,7 @@ pub fn analyse(arena: *std.heap.ArenaAllocator, prepared: *PrepareResult, line: 
     if (line[0] == '@') {
         for (builtins.builtins) |builtin| {
             if (std.mem.eql(u8, builtin.name, line)) {
-                return try std.fmt.allocPrint(&arena.allocator, "https://ziglang.org/documentation/master/#{}", .{line[1..]});
+                return try std.fmt.allocPrint(&arena.allocator, "https://ziglang.org/documentation/master/#{s}", .{line[1..]});
             }
         }
         return null;
@@ -191,7 +191,7 @@ pub fn analyse(arena: *std.heap.ArenaAllocator, prepared: *PrepareResult, line: 
                     const start_loc = handle.tree.tokenLocation(0, start_tok);
                     const end_loc = handle.tree.tokenLocation(0, node.lastToken());
 
-                    return try std.fmt.allocPrint(&arena.allocator, "https://github.com/ziglang/zig/blob/master/lib{}#L{}-L{}\n", .{ result_uri, start_loc.line + 1, end_loc.line + 1 });
+                    return try std.fmt.allocPrint(&arena.allocator, "https://github.com/ziglang/zig/blob/master/lib{s}#L{d}-L{d}\n", .{ result_uri, start_loc.line + 1, end_loc.line + 1 });
                 },
                 else => {},
             }
