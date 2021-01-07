@@ -145,7 +145,7 @@ fn loadPackages(context: LoadPackagesContext) !void {
 /// This function asserts the document is not open yet and takes ownership
 /// of the uri and text passed in.
 fn newDocument(self: *DocumentStore, uri: []const u8, text: []u8) anyerror!*Handle {
-    log.debug("Opened document: {}\n", .{uri});
+    log.debug("Opened document: {s}\n", .{uri});
 
     var handle = try self.allocator.create(Handle);
     errdefer self.allocator.destroy(handle);
