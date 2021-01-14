@@ -14,7 +14,7 @@ pub fn fromPath(allocator: *std.mem.Allocator, path: []const u8) ![]const u8 {
     var buf = std.ArrayList(u8).init(allocator);
     try buf.appendSlice(prefix);
 
-    const out_stream = buf.outStream();
+    const writer = buf.writer();
 
     for (path) |char| {
         if (char == std.fs.path.sep) {
@@ -22,7 +22,7 @@ pub fn fromPath(allocator: *std.mem.Allocator, path: []const u8) ![]const u8 {
         } else if (std.mem.indexOfScalar(u8, reserved_chars, char) != null) {
             // Write '%' + hex with uppercase
             try buf.append('%');
-            try std.fmt.format(out_stream, "{X}", .{char});
+            try std.fmt.format(writer, "{X}", .{char});
         } else {
             try buf.append(char);
         }
