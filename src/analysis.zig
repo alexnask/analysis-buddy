@@ -64,9 +64,9 @@ pub fn collectDocComments(
 pub fn getFunctionSignature(tree: *ast.Tree, func: *ast.Node.FnProto) []const u8 {
     const start = tree.token_locs[func.firstToken()].start;
     const end = tree.token_locs[switch (func.return_type) {
-        .Explicit, .InferErrorSet => |node| node.lastToken(),
-        .Invalid => |r_paren| r_paren,
-    }].end;
+            .Explicit, .InferErrorSet => |node| node.lastToken(),
+            .Invalid => |r_paren| r_paren,
+        }].end;
     return tree.source[start..end];
 }
 
@@ -80,7 +80,7 @@ pub fn getFunctionSnippet(allocator: *std.mem.Allocator, tree: *ast.Tree, func: 
     try buffer.appendSlice(tree.tokenSlice(name_tok));
     try buffer.append('(');
 
-    var buf_stream = buffer.outStream();
+    var buf_stream = buffer.writer();
 
     for (func.paramsConst()) |param, param_num| {
         if (skip_self_param and param_num == 0) continue;
@@ -199,7 +199,7 @@ pub fn getDeclNameToken(tree: *ast.Tree, node: *ast.Node) ?ast.TokenIndex {
         },
         .TestDecl => {
             const decl = node.castTag(.TestDecl).?;
-            return (decl.name.castTag(.StringLiteral) orelse return null).token;
+            return ((decl.name orelse return null).castTag(.StringLiteral) orelse return null).token;
         },
         else => {},
     }
@@ -569,7 +569,13 @@ pub fn resolveTypeOfNodeInternal(
 
             if (try lookupSymbolGlobal(store, arena, handle, handle.tree.getNodeSource(node), handle.tree.token_locs[node.firstToken()].start)) |child| {
                 switch (child.decl.*) {
-                    .ast_node => |n| if (n == node) return null,
+                    .ast_node => |n| {
+                        if (n == node) return null;
+                        if (n.castTag(.VarDecl)) |var_decl| {
+                            if (var_decl.getInitNode()) |init_node|
+                                if (init_node == node) return null;
+                        }
+                    },
                     else => {},
                 }
                 return try child.resolveType(store, arena, bound_type_params);
@@ -807,7 +813,7 @@ pub fn resolveTypeOfNodeInternal(
 
             const import_str = handle.tree.tokenSlice(import_param.castTag(.StringLiteral).?.token);
             const new_handle = (store.resolveImport(handle, import_str[1 .. import_str.len - 1]) catch |err| {
-                log.debug("Error {} while processing import {}\n", .{ err, import_str });
+                log.debug("Error {} while processing import {s}", .{ err, import_str });
                 return null;
             }) orelse return null;
 
@@ -1065,7 +1071,7 @@ pub fn getFieldAccessType(
                         current_type = (try resolveUnwrapOptionalType(store, arena, current_type, &bound_type_params)) orelse return null;
                     },
                     else => {
-                        log.debug("Unrecognized token {} after period.\n", .{after_period.id});
+                        log.debug("Unrecognized token {} after period.", .{after_period.id});
                         return null;
                     },
                 }
@@ -1116,7 +1122,7 @@ pub fn getFieldAccessType(
                 current_type = (try resolveBracketAccessType(store, arena, current_type, if (is_range) .Range else .Single, &bound_type_params)) orelse return null;
             },
             else => {
-                log.debug("Unimplemented token: {}\n", .{tok.id});
+                log.debug("Unimplemented token: {}", .{tok.id});
                 return null;
             },
         }
@@ -1163,7 +1169,7 @@ pub fn nodeToString(tree: *ast.Tree, node: *ast.Node) ?[]const u8 {
             }
         },
         else => {
-            log.debug("INVALID: {}\n", .{node.tag});
+            log.debug("INVALID: {}", .{node.tag});
         },
     }
 
@@ -1999,8 +2005,8 @@ pub const DocumentScope = struct {
             var idx: usize = 0;
             while (decl_it.next()) |name_decl| : (idx += 1) {
                 if (idx != 0) log.debug(", ", .{});
-                log.debug("{}", .{name_decl.key});
             }
+            log.debug("{s}", .{name_decl.key});
             log.debug("\n--------------------------\n", .{});
         }
     }

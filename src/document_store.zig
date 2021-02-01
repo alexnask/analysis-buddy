@@ -38,6 +38,7 @@ handles: std.StringHashMap(*Handle),
 zig_exe_path: ?[]const u8,
 build_files: std.ArrayListUnmanaged(*BuildFile),
 build_runner_path: []const u8,
+build_runner_cache_path: []const u8,
 std_uri: ?[]const u8,
 
 pub fn init(
@@ -45,6 +46,7 @@ pub fn init(
     allocator: *std.mem.Allocator,
     zig_exe_path: ?[]const u8,
     build_runner_path: []const u8,
+    build_runner_cache_path: []const u8,
     zig_lib_path: ?[]const u8,
 ) !void {
     self.allocator = allocator;
@@ -52,6 +54,7 @@ pub fn init(
     self.zig_exe_path = zig_exe_path;
     self.build_files = .{};
     self.build_runner_path = build_runner_path;
+    self.build_runner_cache_path = build_runner_cache_path;
     self.std_uri = try stdUriFromLibPath(allocator, zig_lib_path);
 }
 
@@ -59,6 +62,7 @@ const LoadPackagesContext = struct {
     build_file: *BuildFile,
     allocator: *std.mem.Allocator,
     build_runner_path: []const u8,
+    build_runner_cache_path: []const u8,
     zig_exe_path: []const u8,
 };
 
@@ -66,37 +70,26 @@ fn loadPackages(context: LoadPackagesContext) !void {
     const allocator = context.allocator;
     const build_file = context.build_file;
     const build_runner_path = context.build_runner_path;
+    const build_runner_cache_path = context.build_runner_cache_path;
     const zig_exe_path = context.zig_exe_path;
 
-    const directory_path = try URI.parse(allocator, build_file.uri[0 .. build_file.uri.len - "build.zig".len]);
-    defer allocator.free(directory_path);
-
-    const target_path = try std.fs.path.resolve(allocator, &[_][]const u8{ directory_path, "build_runner.zig" });
-    defer allocator.free(target_path);
-
-    // For example, instead of testing if a file exists and then opening it, just
-    // open it and handle the error for file not found.
-    var file_exists = true;
-    check_file_exists: {
-        var fhandle = std.fs.cwd().openFile(target_path, .{ .read = true, .write = false }) catch |err| switch (err) {
-            error.FileNotFound => {
-                file_exists = false;
-                break :check_file_exists;
-            },
-            else => break :check_file_exists,
-        };
-        fhandle.close();
-    }
-
-    if (file_exists) return error.BuildRunnerFileExists;
-
-    try std.fs.copyFileAbsolute(build_runner_path, target_path, .{});
-    defer std.fs.deleteFileAbsolute(target_path) catch {};
+    const build_file_path = try URI.parse(allocator, build_file.uri);
+    defer allocator.free(build_file_path);
+    const directory_path = build_file_path[0 .. build_file_path.len - "build.zig".len];
 
     const zig_run_result = try std.ChildProcess.exec(.{
         .allocator = allocator,
-        .argv = &[_][]const u8{ zig_exe_path, "run", "build_runner.zig" },
-        .cwd = directory_path,
+        .argv = &[_][]const u8{
+            zig_exe_path,
+            "run",
+            build_runner_path,
+            "--cache-dir",
+            build_runner_cache_path,
+            "--pkg-begin",
+            "@build@",
+            build_file_path,
+            "--pkg-end",
+        },
     });
 
     defer {
@@ -107,7 +100,7 @@ fn loadPackages(context: LoadPackagesContext) !void {
     switch (zig_run_result.term) {
         .Exited => |exit_code| {
             if (exit_code == 0) {
-                log.debug("Finished zig run for build file {}\n", .{build_file.uri});
+                log.debug("Finished zig run for build file {s}", .{build_file.uri});
 
                 for (build_file.packages.items) |old_pkg| {
                     allocator.free(old_pkg.name);
@@ -145,7 +138,7 @@ fn loadPackages(context: LoadPackagesContext) !void {
 /// This function asserts the document is not open yet and takes ownership
 /// of the uri and text passed in.
 fn newDocument(self: *DocumentStore, uri: []const u8, text: []u8) anyerror!*Handle {
-    log.debug("Opened document: {s}\n", .{uri});
+    log.debug("Opened document: {s}", .{uri});
 
     var handle = try self.allocator.create(Handle);
     errdefer self.allocator.destroy(handle);
@@ -173,7 +166,7 @@ fn newDocument(self: *DocumentStore, uri: []const u8, text: []u8) anyerror!*Hand
     // TODO: Better logic for detecting std or subdirectories?
     const in_std = std.mem.indexOf(u8, uri, "/std/") != null;
     if (self.zig_exe_path != null and std.mem.endsWith(u8, uri, "/build.zig") and !in_std) {
-        log.debug("Document is a build file, extracting packages...\n", .{});
+        log.debug("Document is a build file, extracting packages...", .{});
         // This is a build file.
         var build_file = try self.allocator.create(BuildFile);
         errdefer self.allocator.destroy(build_file);
@@ -193,59 +186,81 @@ fn newDocument(self: *DocumentStore, uri: []const u8, text: []u8) anyerror!*Hand
             .build_file = build_file,
             .allocator = self.allocator,
             .build_runner_path = self.build_runner_path,
+            .build_runner_cache_path = self.build_runner_cache_path,
             .zig_exe_path = self.zig_exe_path.?,
         }) catch |err| {
-            log.debug("Failed to load packages of build file {} (error: {})\n", .{ build_file.uri, err });
+            log.debug("Failed to load packages of build file {s} (error: {})", .{ build_file.uri, err });
         };
-    } else if (self.zig_exe_path != null and !in_std) associate_build_file: {
-        // Look into build files to see if we already have one that fits
-        for (self.build_files.items) |build_file| {
-            const build_file_base_uri = build_file.uri[0 .. std.mem.lastIndexOfScalar(u8, build_file.uri, '/').? + 1];
+    } else if (self.zig_exe_path != null and !in_std) {
+        // Look into build files and keep the one that lives closest to the document in the directory structure
+        var candidate: ?*BuildFile = null;
+        {
+            var uri_chars_matched: usize = 0;
+            for (self.build_files.items) |build_file| {
+                const build_file_base_uri = build_file.uri[0 .. std.mem.lastIndexOfScalar(u8, build_file.uri, '/').? + 1];
 
-            if (std.mem.startsWith(u8, uri, build_file_base_uri)) {
-                log.debug("Found an associated build file: {}\n", .{build_file.uri});
-                build_file.refs += 1;
-                handle.associated_build_file = build_file;
-                break :associate_build_file;
+                if (build_file_base_uri.len > uri_chars_matched and std.mem.startsWith(u8, uri, build_file_base_uri)) {
+                    uri_chars_matched = build_file_base_uri.len;
+                    candidate = build_file;
+                }
+            }
+            if (candidate) |build_file| {
+                log.debug("Found a candidate associated build file: `{s}`", .{build_file.uri});
             }
         }
-        // Otherwise, try to find a build file.
+
+        // Then, try to find the closest build file.
         var curr_path = try URI.parse(self.allocator, uri);
         defer self.allocator.free(curr_path);
         while (true) {
-            if (curr_path.len == 0) break :associate_build_file;
+            if (curr_path.len == 0) break;
 
             if (std.mem.lastIndexOfScalar(u8, curr_path[0 .. curr_path.len - 1], std.fs.path.sep)) |idx| {
                 // This includes the last separator
                 curr_path = curr_path[0 .. idx + 1];
 
+                // Try to open the folder, then the file.
                 var folder = std.fs.cwd().openDir(curr_path, .{}) catch |err| switch (err) {
                     error.FileNotFound => continue,
                     else => return err,
                 };
                 defer folder.close();
 
-                // Try to open the file, read it and add the new document if we find it.
-                const build_file_text = folder.readFileAlloc(self.allocator, "build.zig", std.math.maxInt(usize)) catch |err| switch (err) {
+                var build_file = folder.openFile("build.zig", .{}) catch |err| switch (err) {
                     error.FileNotFound, error.AccessDenied => continue,
                     else => return err,
                 };
-                errdefer self.allocator.free(build_file_text);
+                defer build_file.close();
 
+                // Calculate build file's URI
                 var candidate_path = try std.mem.concat(self.allocator, u8, &[_][]const u8{ curr_path, "build.zig" });
                 defer self.allocator.free(candidate_path);
-
                 const build_file_uri = try URI.fromPath(self.allocator, candidate_path);
                 errdefer self.allocator.free(build_file_uri);
 
-                const build_file_handle = try self.newDocument(build_file_uri, build_file_text);
-
-                if (build_file_handle.is_build_file) |build_file| {
-                    build_file.refs += 1;
+                if (candidate) |candidate_build_file| {
+                    // Check if it is the same as the current candidate we got from the existing build files.
+                    // If it isn't, we need to read the file and make a new build file.
+                    if (std.mem.eql(u8, candidate_build_file.uri, build_file_uri)) {
+                        self.allocator.free(build_file_uri);
+                        break;
+                    }
                 }
-                handle.associated_build_file = build_file_handle.is_build_file;
+
+                // Read the build file, create a new document, set the candidate to the new build file.
+                const build_file_text = try build_file.readToEndAlloc(self.allocator, std.math.maxInt(usize));
+                errdefer self.allocator.free(build_file_text);
+
+                const build_file_handle = try self.newDocument(build_file_uri, build_file_text);
+                candidate = build_file_handle.is_build_file.?;
                 break;
-            } else break :associate_build_file;
+            } else break;
+        }
+        // Finally, associate the candidate build file, if any, to the new document.
+        if (candidate) |build_file| {
+            build_file.refs += 1;
+            handle.associated_build_file = build_file;
+            log.debug("Associated build file `{s}` to document `{s}`", .{ build_file.uri, handle.uri() });
         }
     }
 
@@ -255,12 +270,12 @@ fn newDocument(self: *DocumentStore, uri: []const u8, text: []u8) anyerror!*Hand
 
 pub fn openDocument(self: *DocumentStore, uri: []const u8, text: []const u8) !*Handle {
     if (self.handles.getEntry(uri)) |entry| {
-        log.debug("Document already open: {}, incrementing count\n", .{uri});
+        log.debug("Document already open: {s}, incrementing count", .{uri});
         entry.value.count += 1;
         if (entry.value.is_build_file) |build_file| {
             build_file.refs += 1;
         }
-        log.debug("New count: {}\n", .{entry.value.count});
+        log.debug("New count: {}", .{entry.value.count});
         return entry.value;
     }
 
@@ -275,7 +290,7 @@ pub fn openDocument(self: *DocumentStore, uri: []const u8, text: []const u8) !*H
 fn decrementBuildFileRefs(self: *DocumentStore, build_file: *BuildFile) void {
     build_file.refs -= 1;
     if (build_file.refs == 0) {
-        log.debug("Freeing build file {}\n", .{build_file.uri});
+        log.debug("Freeing build file {s}", .{build_file.uri});
         for (build_file.packages.items) |pkg| {
             self.allocator.free(pkg.name);
             self.allocator.free(pkg.uri);
@@ -301,7 +316,7 @@ fn decrementCount(self: *DocumentStore, uri: []const u8) void {
         if (entry.value.count > 0)
             return;
 
-        log.debug("Freeing document: {}\n", .{uri});
+        log.debug("Freeing document: {s}", .{uri});
 
         if (entry.value.associated_build_file) |build_file| {
             self.decrementBuildFileRefs(build_file);
@@ -338,7 +353,7 @@ pub fn getHandle(self: *DocumentStore, uri: []const u8) ?*Handle {
 
 // Check if the document text is now sane, move it to sane_text if so.
 fn refreshDocument(self: *DocumentStore, handle: *Handle, zig_lib_path: ?[]const u8) !void {
-    log.debug("New text for document {}\n", .{handle.uri()});
+    log.debug("New text for document {s}", .{handle.uri()});
     handle.tree.deinit();
     handle.tree = try std.zig.parse(self.allocator, handle.document.text);
 
@@ -384,7 +399,7 @@ fn refreshDocument(self: *DocumentStore, handle: *Handle, zig_lib_path: ?[]const
     while (idx < still_exist.len) : (idx += 1) {
         if (still_exist[idx]) continue;
 
-        log.debug("Import removed: {}\n", .{handle.import_uris.items[idx - offset]});
+        log.debug("Import removed: {s}", .{handle.import_uris.items[idx - offset]});
         const uri = handle.import_uris.orderedRemove(idx - offset);
         offset += 1;
 
@@ -399,9 +414,10 @@ pub fn applySave(self: *DocumentStore, handle: *Handle) !void {
             .build_file = build_file,
             .allocator = self.allocator,
             .build_runner_path = self.build_runner_path,
+            .build_runner_cache_path = self.build_runner_cache_path,
             .zig_exe_path = self.zig_exe_path.?,
         }) catch |err| {
-            log.debug("Failed to load packages of build file {} (error: {})\n", .{ build_file.uri, err });
+            log.debug("Failed to load packages of build file {s} (error: {})", .{ build_file.uri, err });
         };
     }
 }
@@ -427,7 +443,6 @@ pub fn applyChanges(
                 .line = range.Object.get("end").?.Object.get("line").?.Integer,
                 .character = range.Object.get("end").?.Object.get("character").?.Integer,
             };
-
 
             const change_text = change.Object.get("text").?.String;
             const start_index = (try offsets.documentPosition(document.*, start_pos, offset_encoding)).absolute_index;
@@ -483,7 +498,7 @@ pub fn uriFromImportStr(
 ) !?[]const u8 {
     if (std.mem.eql(u8, import_str, "std")) {
         if (self.std_uri) |uri| return try std.mem.dupe(allocator, u8, uri) else {
-            log.debug("Cannot resolve std library import, path is null.\n", .{});
+            log.debug("Cannot resolve std library import, path is null.", .{});
             return null;
         }
     } else if (std.mem.eql(u8, import_str, "builtin")) {
@@ -549,7 +564,7 @@ pub fn resolveImport(self: *DocumentStore, handle: *Handle, import_str: []const 
     defer allocator.free(file_path);
 
     var file = std.fs.cwd().openFile(file_path, .{}) catch {
-        log.debug("Cannot open import file {}\n", .{file_path});
+        log.debug("Cannot open import file {s}", .{file_path});
         return null;
     };
 
@@ -561,7 +576,7 @@ pub fn resolveImport(self: *DocumentStore, handle: *Handle, import_str: []const 
         errdefer allocator.free(file_contents);
 
         file.reader().readNoEof(file_contents) catch {
-            log.debug("Could not read from file {}\n", .{file_path});
+            log.debug("Could not read from file {s}", .{file_path});
             return null;
         };
 
@@ -582,7 +597,7 @@ fn stdUriFromLibPath(allocator: *std.mem.Allocator, zig_lib_path: ?[]const u8) !
         const std_path = std.fs.path.resolve(allocator, &[_][]const u8{
             zpath, "./std/std.zig",
         }) catch |err| {
-            log.debug("Failed to resolve zig std library path, error: {}\n", .{err});
+            log.debug("Failed to resolve zig std library path, error: {}", .{err});
             return null;
         };
 
@@ -624,6 +639,7 @@ pub fn deinit(self: *DocumentStore) void {
         self.allocator.free(std_uri);
     }
     self.allocator.free(self.build_runner_path);
+    self.allocator.free(self.build_runner_cache_path);
     self.build_files.deinit(self.allocator);
 }
 

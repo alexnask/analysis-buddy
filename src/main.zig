@@ -95,7 +95,7 @@ pub fn prepare(gpa: *std.mem.Allocator, std_lib_path: []const u8) !PrepareResult
     std.debug.print("Library path: {s}\n", .{resolved_lib_path});
 
     var result: PrepareResult = undefined;
-    try result.store.init(gpa, null, "", std_lib_path);
+    try result.store.init(gpa, null, "", "", std_lib_path);
     errdefer result.store.deinit();
 
     result.lib_uri = try URI.fromPath(gpa, resolved_lib_path);
@@ -108,7 +108,10 @@ pub fn prepare(gpa: *std.mem.Allocator, std_lib_path: []const u8) !PrepareResult
 }
 
 pub fn reloadCached(arena: *std.heap.ArenaAllocator, gpa: *std.mem.Allocator, prepared: *PrepareResult) !void {
+    const initial_count = prepared.store.handles.count();
     var reloaded: usize = 0;
+    var removals = std.ArrayList([]const u8).init(&arena.allocator);
+    defer removals.deinit();
     var it = prepared.store.handles.iterator();
     while (it.next()) |entry| {
         if (entry.value == prepared.root_handle) {
@@ -121,7 +124,14 @@ pub fn reloadCached(arena: *std.heap.ArenaAllocator, gpa: *std.mem.Allocator, pr
             else => unreachable,
         };
 
-        const new_text = try std.fs.cwd().readFileAlloc(gpa, path, std.math.maxInt(usize));
+        const new_text = std.fs.cwd().readFileAlloc(gpa, path, std.math.maxInt(usize)) catch |err| switch (err) {
+            error.FileNotFound => {
+                // prepared.store
+                try removals.append(entry.key);
+                continue;
+            },
+            else => |e| return e,
+        };
         // Completely replace the whole text of the document
         gpa.free(entry.value.document.mem);
         entry.value.document.mem = new_text;
@@ -133,7 +143,29 @@ pub fn reloadCached(arena: *std.heap.ArenaAllocator, gpa: *std.mem.Allocator, pr
 
         reloaded += 1;
     }
-    std.debug.print("Realoded {d} of {d} cached documents.\n", .{ reloaded, prepared.store.handles.count() - 1 });
+
+    for (removals.items) |rm| {
+        const entry = prepared.store.handles.getEntry(rm).?;
+        entry.value.tree.deinit();
+        prepared.store.allocator.free(entry.value.document.mem);
+
+        for (entry.value.import_uris.items) |import_uri| {
+            prepared.store.closeDocument(import_uri);
+            prepared.store.allocator.free(import_uri);
+        }
+
+        entry.value.document_scope.deinit(prepared.store.allocator);
+        entry.value.import_uris.deinit();
+        prepared.store.allocator.destroy(entry.value);
+        const uri_key = entry.key;
+        prepared.store.handles.removeAssertDiscard(rm);
+        prepared.store.allocator.free(uri_key);
+    }
+    std.debug.print("Reloaded {d} of {d} cached documents, removed {d}.\n", .{
+        reloaded,
+        initial_count - 1,
+        removals.items.len,
+    });
 }
 
 pub fn dispose(prepared: *PrepareResult) void {
