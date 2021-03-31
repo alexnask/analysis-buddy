@@ -5,6 +5,8 @@ const URI = @import("uri.zig");
 const ast = std.zig.ast;
 const builtins = @import("builtins.zig");
 
+usingnamespace @import("ast.zig");
+
 pub fn getFieldAccessType(
     store: *DocumentStore,
     arena: *std.heap.ArenaAllocator,
@@ -13,7 +15,7 @@ pub fn getFieldAccessType(
     bound_type_params: *analysis.BoundTypeParams,
 ) !?analysis.DeclWithHandle {
     var current_type = analysis.TypeWithHandle.typeVal(.{
-        .node = &handle.tree.root_node.base,
+        .node = 0,
         .handle = handle,
     });
 
@@ -21,18 +23,24 @@ pub fn getFieldAccessType(
 
     while (true) {
         const tok = tokenizer.next();
-        switch (tok.id) {
-            .Eof => return result,
-            .Identifier => {
-                if (try analysis.lookupSymbolGlobal(store, arena, current_type.handle, tokenizer.buffer[tok.loc.start..tok.loc.end], 0)) |child| {
+        switch (tok.tag) {
+            .eof => return result,
+            .identifier => {
+                if (try analysis.lookupSymbolGlobal(
+                    store,
+                    arena,
+                    current_type.handle,
+                    tokenizer.buffer[tok.loc.start..tok.loc.end],
+                    0,
+                )) |child| {
                     current_type = (try child.resolveType(store, arena, bound_type_params)) orelse return null;
                 } else return null;
             },
-            .Period => {
+            .period => {
                 const after_period = tokenizer.next();
-                switch (after_period.id) {
-                    .Eof => return result,
-                    .Identifier => {
+                switch (after_period.tag) {
+                    .eof => return result,
+                    .identifier => {
                         if (result) |child| {
                             current_type = (try child.resolveType(store, arena, bound_type_params)) orelse return null;
                         }
@@ -43,8 +51,22 @@ pub fn getFieldAccessType(
                             else => return null,
                         };
 
-                        if (current_type_node.castTag(.FnProto)) |func| {
-                            if (try analysis.resolveReturnType(store, arena, func, current_type.handle, bound_type_params)) |ret| {
+                        var buf: [1]ast.Node.Index = undefined;
+                        if (fnProto(current_type.handle.tree, current_type_node, &buf)) |func| {
+                            // Check if the function has a body and if so, pass it
+                            // so the type can be resolved if it's a generic function returning
+                            // an anonymous struct
+                            const has_body = current_type.handle.tree.nodes.items(.tag)[current_type_node] == .fn_decl;
+                            const body = current_type.handle.tree.nodes.items(.data)[current_type_node].rhs;
+
+                            if (try analysis.resolveReturnType(
+                                store,
+                                arena,
+                                func,
+                                current_type.handle,
+                                bound_type_params,
+                                if (has_body) body else null,
+                            )) |ret| {
                                 current_type = ret;
                                 current_type_node = switch (current_type.type.data) {
                                     .other => |n| n,
@@ -136,26 +158,23 @@ pub fn reloadCached(arena: *std.heap.ArenaAllocator, gpa: *std.mem.Allocator, pr
         gpa.free(entry.value.document.mem);
         entry.value.document.mem = new_text;
         entry.value.document.text = new_text;
-        entry.value.tree.deinit();
-        entry.value.tree = try std.zig.parse(gpa, new_text);
-        entry.value.document_scope.deinit(gpa);
-        entry.value.document_scope = try analysis.makeDocumentScope(gpa, entry.value.tree);
+        try prepared.store.refreshDocument(entry.value);
 
         reloaded += 1;
     }
 
     for (removals.items) |rm| {
         const entry = prepared.store.handles.getEntry(rm).?;
-        entry.value.tree.deinit();
+        entry.value.tree.deinit(gpa);
         prepared.store.allocator.free(entry.value.document.mem);
 
-        for (entry.value.import_uris.items) |import_uri| {
+        for (entry.value.import_uris) |import_uri| {
             prepared.store.closeDocument(import_uri);
             prepared.store.allocator.free(import_uri);
         }
-
+        prepared.store.allocator.free(entry.value.import_uris);
+        entry.value.imports_used.deinit(prepared.store.allocator);
         entry.value.document_scope.deinit(prepared.store.allocator);
-        entry.value.import_uris.deinit();
         prepared.store.allocator.destroy(entry.value);
         const uri_key = entry.key;
         prepared.store.handles.removeAssertDiscard(rm);
@@ -190,7 +209,11 @@ pub fn analyse(arena: *std.heap.ArenaAllocator, prepared: *PrepareResult, line: 
                 .ast_node => |n| {
                     var handle = result.handle;
                     var node = n;
-                    if (try analysis.resolveVarDeclAlias(&prepared.store, arena, .{ .node = node, .handle = result.handle })) |alias_result| {
+                    if (try analysis.resolveVarDeclAlias(
+                        &prepared.store,
+                        arena,
+                        .{ .node = node, .handle = result.handle },
+                    )) |alias_result| {
                         switch (alias_result.decl.*) {
                             .ast_node => |inner| {
                                 handle = alias_result.handle;
@@ -198,30 +221,52 @@ pub fn analyse(arena: *std.heap.ArenaAllocator, prepared: *PrepareResult, line: 
                             },
                             else => {},
                         }
-                    } else if (node.castTag(.VarDecl)) |vdecl| try_import_resolve: {
-                        if (vdecl.getInitNode()) |init| {
-                            if (init.castTag(.BuiltinCall)) |builtin| {
-                                if (std.mem.eql(u8, handle.tree.tokenSlice(builtin.builtin_token), "@import") and builtin.params_len == 1) {
-                                    const import_type = (try result.resolveType(&prepared.store, arena, &bound_type_params)) orelse break :try_import_resolve;
-                                    switch (import_type.type.data) {
-                                        .other => |resolved_node| {
-                                            handle = import_type.handle;
-                                            node = resolved_node;
-                                        },
-                                        else => {},
+                    } else if (varDecl(result.handle.tree, node)) |vdecl| try_import_resolve: {
+                        if (vdecl.ast.init_node != 0) {
+                            const tree = result.handle.tree;
+                            const node_tags = tree.nodes.items(.tag);
+                            if (isBuiltinCall(tree, vdecl.ast.init_node)) {
+                                const builtin_token = tree.nodes.items(.main_token)[vdecl.ast.init_node];
+                                const call_name = tree.tokenSlice(builtin_token);
+
+                                if (std.mem.eql(u8, call_name, "@import")) {
+                                    const data = tree.nodes.items(.data)[vdecl.ast.init_node];
+                                    const params = switch (node_tags[vdecl.ast.init_node]) {
+                                        .builtin_call, .builtin_call_comma => tree.extra_data[data.lhs..data.rhs],
+                                        .builtin_call_two, .builtin_call_two_comma => if (data.lhs == 0)
+                                            &[_]ast.Node.Index{}
+                                        else if (data.rhs == 0)
+                                            &[_]ast.Node.Index{data.lhs}
+                                        else
+                                            &[_]ast.Node.Index{ data.lhs, data.rhs },
+                                        else => unreachable,
+                                    };
+                                    if (params.len == 1) {
+                                        const import_type = (try result.resolveType(
+                                            &prepared.store,
+                                            arena,
+                                            &bound_type_params,
+                                        )) orelse break :try_import_resolve;
+                                        switch (import_type.type.data) {
+                                            .other => |resolved_node| {
+                                                handle = import_type.handle;
+                                                node = resolved_node;
+                                            },
+                                            else => {},
+                                        }
                                     }
                                 }
                             }
                         }
                     }
-                    const start_tok = if (analysis.getDocCommentNode(handle.tree, node)) |doc_comment|
-                        doc_comment.first_line
+                    const start_tok = if (analysis.getDocCommentTokenIndex(handle.tree, node)) |doc_comment|
+                        doc_comment
                     else
-                        node.firstToken();
+                        handle.tree.firstToken(node);
 
                     const result_uri = handle.uri()[prepared.lib_uri.len..];
                     const start_loc = handle.tree.tokenLocation(0, start_tok);
-                    const end_loc = handle.tree.tokenLocation(0, node.lastToken());
+                    const end_loc = handle.tree.tokenLocation(0, handle.tree.lastToken(node));
 
                     return try std.fmt.allocPrint(&arena.allocator, "https://github.com/ziglang/zig/blob/master/lib{s}#L{d}-L{d}\n", .{ result_uri, start_loc.line + 1, end_loc.line + 1 });
                 },

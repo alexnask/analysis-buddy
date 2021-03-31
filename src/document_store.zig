@@ -21,8 +21,11 @@ const BuildFile = struct {
 pub const Handle = struct {
     document: types.TextDocument,
     count: usize,
-    import_uris: std.ArrayList([]const u8),
-    tree: *std.zig.ast.Tree,
+    /// Contains one entry for every import in the document
+    import_uris: []const []const u8,
+    /// Items in thsi array list come from `import_uris`
+    imports_used: std.ArrayListUnmanaged([]const u8),
+    tree: std.zig.ast.Tree,
     document_scope: analysis.DocumentScope,
 
     associated_build_file: ?*BuildFile,
@@ -143,15 +146,16 @@ fn newDocument(self: *DocumentStore, uri: []const u8, text: []u8) anyerror!*Hand
     var handle = try self.allocator.create(Handle);
     errdefer self.allocator.destroy(handle);
 
-    const tree = try std.zig.parse(self.allocator, text);
-    errdefer tree.deinit();
+    var tree = try std.zig.parse(self.allocator, text);
+    errdefer tree.deinit(self.allocator);
 
-    const document_scope = try analysis.makeDocumentScope(self.allocator, tree);
+    var document_scope = try analysis.makeDocumentScope(self.allocator, tree);
     errdefer document_scope.deinit(self.allocator);
 
     handle.* = Handle{
         .count = 1,
-        .import_uris = std.ArrayList([]const u8).init(self.allocator),
+        .import_uris = &.{},
+        .imports_used = .{},
         .document = .{
             .uri = uri,
             .text = text,
@@ -233,7 +237,7 @@ fn newDocument(self: *DocumentStore, uri: []const u8, text: []u8) anyerror!*Hand
                 defer build_file.close();
 
                 // Calculate build file's URI
-                var candidate_path = try std.mem.concat(self.allocator, u8, &[_][]const u8{ curr_path, "build.zig" });
+                var candidate_path = try std.mem.concat(self.allocator, u8, &.{ curr_path, "build.zig" });
                 defer self.allocator.free(candidate_path);
                 const build_file_uri = try URI.fromPath(self.allocator, candidate_path);
                 errdefer self.allocator.free(build_file_uri);
@@ -262,6 +266,14 @@ fn newDocument(self: *DocumentStore, uri: []const u8, text: []u8) anyerror!*Hand
             handle.associated_build_file = build_file;
             log.debug("Associated build file `{s}` to document `{s}`", .{ build_file.uri, handle.uri() });
         }
+    }
+
+    handle.import_uris = try self.collectImportUris(handle);
+    errdefer {
+        for (handle.import_uris) |imp_uri| {
+            self.allocator.free(imp_uri);
+        }
+        self.allocator.free(handle.import_uris);
     }
 
     try self.handles.putNoClobber(uri, handle);
@@ -326,16 +338,20 @@ fn decrementCount(self: *DocumentStore, uri: []const u8) void {
             self.decrementBuildFileRefs(build_file);
         }
 
-        entry.value.tree.deinit();
+        entry.value.tree.deinit(self.allocator);
         self.allocator.free(entry.value.document.mem);
 
-        for (entry.value.import_uris.items) |import_uri| {
+        for (entry.value.imports_used.items) |import_uri| {
             self.decrementCount(import_uri);
+        }
+
+        for (entry.value.import_uris) |import_uri| {
             self.allocator.free(import_uri);
         }
 
         entry.value.document_scope.deinit(self.allocator);
-        entry.value.import_uris.deinit();
+        entry.value.imports_used.deinit(self.allocator);
+        self.allocator.free(entry.value.import_uris);
         self.allocator.destroy(entry.value);
         const uri_key = entry.key;
         self.handles.removeAssertDiscard(uri);
@@ -351,60 +367,71 @@ pub fn getHandle(self: *DocumentStore, uri: []const u8) ?*Handle {
     return self.handles.get(uri);
 }
 
-// Check if the document text is now sane, move it to sane_text if so.
-fn refreshDocument(self: *DocumentStore, handle: *Handle, zig_lib_path: ?[]const u8) !void {
+fn collectImportUris(self: *DocumentStore, handle: *Handle) ![]const []const u8 {
+    var new_imports = std.ArrayList([]const u8).init(self.allocator);
+    errdefer {
+        for (new_imports.items) |imp| {
+            self.allocator.free(imp);
+        }
+        new_imports.deinit();
+    }
+    try analysis.collectImports(&new_imports, handle.tree);
+
+    // Convert to URIs
+    var i: usize = 0;
+    while (i < new_imports.items.len) {
+        if (try self.uriFromImportStr(self.allocator, handle.*, new_imports.items[i])) |uri| {
+            // The raw import strings are owned by the document and do not need to be freed here.
+            new_imports.items[i] = uri;
+            i += 1;
+        } else {
+            _ = new_imports.swapRemove(i);
+        }
+    }
+    return new_imports.toOwnedSlice();
+}
+
+pub fn refreshDocument(self: *DocumentStore, handle: *Handle) !void {
     log.debug("New text for document {s}", .{handle.uri()});
-    handle.tree.deinit();
+    handle.tree.deinit(self.allocator);
     handle.tree = try std.zig.parse(self.allocator, handle.document.text);
 
     handle.document_scope.deinit(self.allocator);
     handle.document_scope = try analysis.makeDocumentScope(self.allocator, handle.tree);
 
-    // TODO: Better algorithm or data structure?
-    // Removing the imports is costly since they live in an array list
-    // Perhaps we should use an AutoHashMap([]const u8, {}) ?
-
-    // Try to detect removed imports and decrement their counts.
-    if (handle.import_uris.items.len == 0) return;
-
-    var arena = std.heap.ArenaAllocator.init(self.allocator);
-    defer arena.deinit();
-
-    var import_strs = std.ArrayList([]const u8).init(&arena.allocator);
-    try analysis.collectImports(&import_strs, handle.tree);
-
-    const still_exist = try arena.allocator.alloc(bool, handle.import_uris.items.len);
-    for (still_exist) |*ex| {
-        ex.* = false;
-    }
-
-    const std_uri = try stdUriFromLibPath(&arena.allocator, zig_lib_path);
-    for (import_strs.items) |str| {
-        const uri = (try self.uriFromImportStr(&arena.allocator, handle.*, str)) orelse continue;
-
-        var idx: usize = 0;
-        exists_loop: while (idx < still_exist.len) : (idx += 1) {
-            if (still_exist[idx]) continue;
-
-            if (std.mem.eql(u8, handle.import_uris.items[idx], uri)) {
-                still_exist[idx] = true;
-                break :exists_loop;
-            }
+    const new_imports = try self.collectImportUris(handle);
+    errdefer {
+        for (new_imports) |imp| {
+            self.allocator.free(imp);
         }
+        self.allocator.free(new_imports);
     }
 
-    // Go through still_exist, remove the items that are false and decrement their handle counts.
-    var offset: usize = 0;
-    var idx: usize = 0;
-    while (idx < still_exist.len) : (idx += 1) {
-        if (still_exist[idx]) continue;
+    const old_imports = handle.import_uris;
+    handle.import_uris = new_imports;
+    defer {
+        for (old_imports) |uri| {
+            self.allocator.free(uri);
+        }
+        self.allocator.free(old_imports);
+    }
 
-        log.debug("Import removed: {s}", .{handle.import_uris.items[idx - offset]});
-        const uri = handle.import_uris.orderedRemove(idx - offset);
-        offset += 1;
-
-        self.decrementCount(uri);
-        self.allocator.free(uri);
+    var i: usize = 0;
+    while (i < handle.imports_used.items.len) {
+        const old = handle.imports_used.items[i];
+        still_exists: {
+            for (new_imports) |new| {
+                if (std.mem.eql(u8, new, old)) {
+                    handle.imports_used.items[i] = new;
+                    break :still_exists;
+                }
+            }
+            log.debug("Import removed: {s}", .{old});
+            self.decrementCount(old);
+            _ = handle.imports_used.swapRemove(i);
+            continue;
+        }
+        i += 1;
     }
 }
 
@@ -427,7 +454,6 @@ pub fn applyChanges(
     handle: *Handle,
     content_changes: std.json.Array,
     offset_encoding: offsets.Encoding,
-    zig_lib_path: ?[]const u8,
 ) !void {
     const document = &handle.document;
 
@@ -435,13 +461,16 @@ pub fn applyChanges(
         if (change.Object.get("range")) |range| {
             std.debug.assert(document.text.ptr == document.mem.ptr);
 
+            // TODO: add tests and validate the JSON
+            const start_obj = range.Object.get("start").?.Object;
             const start_pos = types.Position{
-                .line = range.Object.get("start").?.Object.get("line").?.Integer,
-                .character = range.Object.get("start").?.Object.get("character").?.Integer,
+                .line = start_obj.get("line").?.Integer,
+                .character = start_obj.get("character").?.Integer,
             };
+            const end_obj = range.Object.get("end").?.Object;
             const end_pos = types.Position{
-                .line = range.Object.get("end").?.Object.get("line").?.Integer,
-                .character = range.Object.get("end").?.Object.get("character").?.Integer,
+                .line = end_obj.get("line").?.Integer,
+                .character = end_obj.get("character").?.Integer,
             };
 
             const change_text = change.Object.get("text").?.String;
@@ -487,7 +516,7 @@ pub fn applyChanges(
         }
     }
 
-    try self.refreshDocument(handle, zig_lib_path);
+    try self.refreshDocument(handle);
 }
 
 pub fn uriFromImportStr(
@@ -513,18 +542,16 @@ pub fn uriFromImportStr(
         }
         return null;
     } else {
-        // Find relative uri
-        const path = try URI.parse(allocator, handle.uri());
-        defer allocator.free(path);
-
-        const dir_path = std.fs.path.dirname(path) orelse "";
-        const import_path = try std.fs.path.resolve(allocator, &[_][]const u8{
-            dir_path, import_str,
-        });
-
-        defer allocator.free(import_path);
-
-        return try URI.fromPath(allocator, import_path);
+        const base = handle.uri();
+        var base_len = base.len;
+        while (base[base_len - 1] != '/' and base_len > 0) {
+            base_len -= 1;
+        }
+        base_len -= 1;
+        if (base_len <= 0) {
+            return error.UriBadScheme;
+        }
+        return try URI.pathRelative(allocator, base[0..base_len], import_str);
     }
 }
 
@@ -535,26 +562,36 @@ pub fn resolveImport(self: *DocumentStore, handle: *Handle, import_str: []const 
         handle.*,
         import_str,
     )) orelse return null;
+    defer allocator.free(final_uri);
 
-    var consumed_final_uri = false;
-    defer if (!consumed_final_uri) allocator.free(final_uri);
-
-    // Check if we already imported this.
-    for (handle.import_uris.items) |uri| {
-        // If we did, set our new handle and return the parsed tree root node.
+    for (handle.imports_used.items) |uri| {
         if (std.mem.eql(u8, uri, final_uri)) {
-            return self.getHandle(final_uri);
+            return self.getHandle(final_uri).?;
         }
     }
+    // The URI must be somewhere in the import_uris or the package uris
+    const handle_uri = find_uri: {
+        for (handle.import_uris) |uri| {
+            if (std.mem.eql(u8, uri, final_uri)) {
+                break :find_uri uri;
+            }
+        }
+        if (handle.associated_build_file) |bf| {
+            for (bf.packages.items) |pkg| {
+                if (std.mem.eql(u8, pkg.uri, final_uri)) {
+                    break :find_uri pkg.uri;
+                }
+            }
+        }
+        return null;
+    };
 
     // New import.
     // Check if the import is already opened by others.
     if (self.getHandle(final_uri)) |new_handle| {
         // If it is, append it to our imports, increment the count, set our new handle
         // and return the parsed tree root node.
-        try handle.import_uris.append(final_uri);
-        consumed_final_uri = true;
-
+        try handle.imports_used.append(self.allocator, handle_uri);
         new_handle.count += 1;
         return new_handle;
     }
@@ -569,21 +606,18 @@ pub fn resolveImport(self: *DocumentStore, handle: *Handle, import_str: []const 
     };
 
     defer file.close();
-    const size = std.math.cast(usize, try file.getEndPos()) catch std.math.maxInt(usize);
-
     {
-        const file_contents = try allocator.alloc(u8, size);
+        const file_contents = file.readToEndAlloc(allocator, std.math.maxInt(usize)) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => {
+                log.debug("Could not read from file {s}", .{file_path});
+                return null;
+            },
+        };
         errdefer allocator.free(file_contents);
 
-        file.reader().readNoEof(file_contents) catch {
-            log.debug("Could not read from file {s}", .{file_path});
-            return null;
-        };
-
         // Add to import table of current handle.
-        try handle.import_uris.append(final_uri);
-        consumed_final_uri = true;
-
+        try handle.imports_used.append(self.allocator, handle_uri);
         // Swap handles.
         // This takes ownership of the passed uri and text.
         const duped_final_uri = try std.mem.dupe(allocator, u8, final_uri);
@@ -613,14 +647,13 @@ pub fn deinit(self: *DocumentStore) void {
     var entry_iterator = self.handles.iterator();
     while (entry_iterator.next()) |entry| {
         entry.value.document_scope.deinit(self.allocator);
-        entry.value.tree.deinit();
+        entry.value.tree.deinit(self.allocator);
         self.allocator.free(entry.value.document.mem);
-
-        for (entry.value.import_uris.items) |uri| {
+        for (entry.value.import_uris) |uri| {
             self.allocator.free(uri);
         }
-
-        entry.value.import_uris.deinit();
+        self.allocator.free(entry.value.import_uris);
+        entry.value.imports_used.deinit(self.allocator);
         self.allocator.free(entry.key);
         self.allocator.destroy(entry.value);
     }
@@ -643,31 +676,45 @@ pub fn deinit(self: *DocumentStore) void {
     self.build_files.deinit(self.allocator);
 }
 
-fn tagStoreCompletionItems(self: DocumentStore, arena: *std.heap.ArenaAllocator, base: *DocumentStore.Handle, comptime name: []const u8) ![]types.CompletionItem {
+fn tagStoreCompletionItems(
+    self: DocumentStore,
+    arena: *std.heap.ArenaAllocator,
+    base: *DocumentStore.Handle,
+    comptime name: []const u8,
+) ![]types.CompletionItem {
     // TODO Better solution for deciding what tags to include
-    var handle_arr = try arena.allocator.alloc(*DocumentStore.Handle, base.import_uris.items.len + 1);
-    handle_arr[0] = base;
-    var len: usize = @field(base.document_scope, name).len;
-    for (base.import_uris.items) |uri, idx| {
-        handle_arr[idx + 1] = self.handles.get(uri).?;
-        len += @field(handle_arr[idx + 1].document_scope, name).len;
+    var max_len: usize = @field(base.document_scope, name).count();
+    for (base.imports_used.items) |uri| {
+        max_len += @field(self.handles.get(uri).?.document_scope, name).count();
     }
 
-    var result = try arena.allocator.alloc(types.CompletionItem, len);
-    var res_idx: usize = 0;
-    for (handle_arr) |handle| {
-        for (@field(handle.document_scope, name)) |item| {
-            result[res_idx] = item;
-            res_idx += 1;
+    var result_set = analysis.CompletionSet{};
+    try result_set.ensureCapacity(&arena.allocator, max_len);
+    result_set.entries.appendSliceAssumeCapacity(@field(base.document_scope, name).entries.items);
+    try result_set.reIndex(&arena.allocator);
+
+    for (base.imports_used.items) |uri| {
+        const curr_set = &@field(self.handles.get(uri).?.document_scope, name);
+        for (curr_set.entries.items) |entry| {
+            result_set.putAssumeCapacity(entry.key, {});
         }
     }
-    return result;
+    // This is safe to do because CompletionSet.Entry == struct { value: types.CompletionItem }
+    return std.mem.bytesAsSlice(types.CompletionItem, std.mem.sliceAsBytes(result_set.entries.items));
 }
 
-pub fn errorCompletionItems(self: DocumentStore, arena: *std.heap.ArenaAllocator, base: *DocumentStore.Handle) ![]types.CompletionItem {
+pub fn errorCompletionItems(
+    self: DocumentStore,
+    arena: *std.heap.ArenaAllocator,
+    base: *DocumentStore.Handle,
+) ![]types.CompletionItem {
     return try self.tagStoreCompletionItems(arena, base, "error_completions");
 }
 
-pub fn enumCompletionItems(self: DocumentStore, arena: *std.heap.ArenaAllocator, base: *DocumentStore.Handle) ![]types.CompletionItem {
+pub fn enumCompletionItems(
+    self: DocumentStore,
+    arena: *std.heap.ArenaAllocator,
+    base: *DocumentStore.Handle,
+) ![]types.CompletionItem {
     return try self.tagStoreCompletionItems(arena, base, "enum_completions");
 }

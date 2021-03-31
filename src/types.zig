@@ -230,8 +230,8 @@ pub const CompletionItem = struct {
     label: []const u8,
     kind: Kind,
     textEdit: ?TextEdit = null,
-    filterText: ?[]const u8 = null,
-    insertText: ?[]const u8 = null,
+    filterText: []const u8 = "",
+    insertText: []const u8 = "",
     insertTextFormat: ?InsertTextFormat = .PlainText,
     detail: ?[]const u8 = null,
     documentation: ?MarkupContent = null,
@@ -331,8 +331,8 @@ const InitializeResult = struct {
         workspaceSymbolProvider: bool,
         rangeProvider: bool,
         documentProvider: bool,
-        workspace: struct {
-            workspaceFolders: struct {
+        workspace: ?struct {
+            workspaceFolders: ?struct {
                 supported: bool,
                 changeNotifications: bool,
             },
