@@ -111,7 +111,7 @@ fn loadPackages(context: LoadPackagesContext) !void {
                 }
 
                 build_file.packages.shrinkAndFree(allocator, 0);
-                var line_it = std.mem.split(zig_run_result.stdout, "\n");
+                var line_it = std.mem.split(u8, zig_run_result.stdout, "\n");
                 while (line_it.next()) |line| {
                     if (std.mem.indexOfScalar(u8, line, '\x00')) |zero_byte_idx| {
                         const name = line[0..zero_byte_idx];
@@ -140,7 +140,7 @@ fn loadPackages(context: LoadPackagesContext) !void {
 
 /// This function asserts the document is not open yet and takes ownership
 /// of the uri and text passed in.
-fn newDocument(self: *DocumentStore, uri: []const u8, text: []u8) anyerror!*Handle {
+fn newDocument(self: *DocumentStore, uri: []const u8, text: [:0]u8) anyerror!*Handle {
     log.debug("Opened document: {s}", .{uri});
 
     var handle = try self.allocator.create(Handle);
@@ -252,7 +252,7 @@ fn newDocument(self: *DocumentStore, uri: []const u8, text: []u8) anyerror!*Hand
                 }
 
                 // Read the build file, create a new document, set the candidate to the new build file.
-                const build_file_text = try build_file.readToEndAlloc(self.allocator, std.math.maxInt(usize));
+                const build_file_text = try build_file.readToEndAllocOptions(self.allocator, std.math.maxInt(usize), null, @alignOf(u8), 0);
                 errdefer self.allocator.free(build_file_text);
 
                 const build_file_handle = try self.newDocument(build_file_uri, build_file_text);
@@ -283,15 +283,15 @@ fn newDocument(self: *DocumentStore, uri: []const u8, text: []u8) anyerror!*Hand
 pub fn openDocument(self: *DocumentStore, uri: []const u8, text: []const u8) !*Handle {
     if (self.handles.getEntry(uri)) |entry| {
         log.debug("Document already open: {s}, incrementing count", .{uri});
-        entry.value.count += 1;
-        if (entry.value.is_build_file) |build_file| {
+        entry.value_ptr.*.count += 1;
+        if (entry.value_ptr.*.is_build_file) |build_file| {
             build_file.refs += 1;
         }
-        log.debug("New count: {}", .{entry.value.count});
-        return entry.value;
+        log.debug("New count: {}", .{entry.value_ptr.*.count});
+        return entry.value_ptr.*;
     }
 
-    const duped_text = try std.mem.dupe(self.allocator, u8, text);
+    const duped_text = try std.mem.dupeZ(self.allocator, u8, text);
     errdefer self.allocator.free(duped_text);
     const duped_uri = try std.mem.dupe(self.allocator, u8, uri);
     errdefer self.allocator.free(duped_uri);
@@ -322,39 +322,39 @@ fn decrementBuildFileRefs(self: *DocumentStore, build_file: *BuildFile) void {
 
 fn decrementCount(self: *DocumentStore, uri: []const u8) void {
     if (self.handles.getEntry(uri)) |entry| {
-        if (entry.value.count == 0) return;
-        entry.value.count -= 1;
+        if (entry.value_ptr.*.count == 0) return;
+        entry.value_ptr.*.count -= 1;
 
-        if (entry.value.count > 0)
+        if (entry.value_ptr.*.count > 0)
             return;
 
         log.debug("Freeing document: {s}", .{uri});
 
-        if (entry.value.associated_build_file) |build_file| {
+        if (entry.value_ptr.*.associated_build_file) |build_file| {
             self.decrementBuildFileRefs(build_file);
         }
 
-        if (entry.value.is_build_file) |build_file| {
+        if (entry.value_ptr.*.is_build_file) |build_file| {
             self.decrementBuildFileRefs(build_file);
         }
 
-        entry.value.tree.deinit(self.allocator);
-        self.allocator.free(entry.value.document.mem);
+        entry.value_ptr.*.tree.deinit(self.allocator);
+        self.allocator.free(entry.value_ptr.*.document.mem);
 
-        for (entry.value.imports_used.items) |import_uri| {
+        for (entry.value_ptr.*.imports_used.items) |import_uri| {
             self.decrementCount(import_uri);
         }
 
-        for (entry.value.import_uris) |import_uri| {
+        for (entry.value_ptr.*.import_uris) |import_uri| {
             self.allocator.free(import_uri);
         }
 
-        entry.value.document_scope.deinit(self.allocator);
-        entry.value.imports_used.deinit(self.allocator);
-        self.allocator.free(entry.value.import_uris);
-        self.allocator.destroy(entry.value);
-        const uri_key = entry.key;
-        self.handles.removeAssertDiscard(uri);
+        entry.value_ptr.*.document_scope.deinit(self.allocator);
+        entry.value_ptr.*.imports_used.deinit(self.allocator);
+        self.allocator.free(entry.value_ptr.*.import_uris);
+        self.allocator.destroy(entry.value_ptr.*);
+        const uri_key = entry.key_ptr.*;
+        std.debug.assert(self.handles.remove(uri));
         self.allocator.free(uri_key);
     }
 }
@@ -607,7 +607,7 @@ pub fn resolveImport(self: *DocumentStore, handle: *Handle, import_str: []const 
 
     defer file.close();
     {
-        const file_contents = file.readToEndAlloc(allocator, std.math.maxInt(usize)) catch |err| switch (err) {
+        const file_contents = file.readToEndAllocOptions(allocator, std.math.maxInt(usize), null, @alignOf(u8), 0) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => {
                 log.debug("Could not read from file {s}", .{file_path});
@@ -646,16 +646,16 @@ fn stdUriFromLibPath(allocator: *std.mem.Allocator, zig_lib_path: ?[]const u8) !
 pub fn deinit(self: *DocumentStore) void {
     var entry_iterator = self.handles.iterator();
     while (entry_iterator.next()) |entry| {
-        entry.value.document_scope.deinit(self.allocator);
-        entry.value.tree.deinit(self.allocator);
-        self.allocator.free(entry.value.document.mem);
-        for (entry.value.import_uris) |uri| {
+        entry.value_ptr.*.document_scope.deinit(self.allocator);
+        entry.value_ptr.*.tree.deinit(self.allocator);
+        self.allocator.free(entry.value_ptr.*.document.mem);
+        for (entry.value_ptr.*.import_uris) |uri| {
             self.allocator.free(uri);
         }
-        self.allocator.free(entry.value.import_uris);
-        entry.value.imports_used.deinit(self.allocator);
-        self.allocator.free(entry.key);
-        self.allocator.destroy(entry.value);
+        self.allocator.free(entry.value_ptr.*.import_uris);
+        entry.value_ptr.*.imports_used.deinit(self.allocator);
+        self.allocator.free(entry.key_ptr.*);
+        self.allocator.destroy(entry.value_ptr.*);
     }
 
     self.handles.deinit();

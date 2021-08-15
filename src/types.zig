@@ -113,7 +113,7 @@ pub const Diagnostic = struct {
 pub const TextDocument = struct {
     uri: []const u8,
     // This is a substring of mem starting at 0
-    text: []const u8,
+    text: [:0]const u8,
     // This holds the memory that we have actually allocated.
     mem: []u8,
 };
@@ -238,7 +238,7 @@ pub const CompletionItem = struct {
 };
 
 pub const DocumentSymbol = struct {
-    const Kind = enum {
+    const Kind = enum(u8) {
         File = 1,
         Module = 2,
         Namespace = 3,
@@ -296,7 +296,7 @@ const InitializeResult = struct {
         signatureHelpProvider: struct {
             triggerCharacters: []const []const u8,
         },
-        textDocumentSync: enum {
+        textDocumentSync: enum(u8) {
             None = 0,
             Full = 1,
             Incremental = 2,

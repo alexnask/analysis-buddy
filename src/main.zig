@@ -136,48 +136,48 @@ pub fn reloadCached(arena: *std.heap.ArenaAllocator, gpa: *std.mem.Allocator, pr
     defer removals.deinit();
     var it = prepared.store.handles.iterator();
     while (it.next()) |entry| {
-        if (entry.value == prepared.root_handle) {
+        if (entry.value_ptr.* == prepared.root_handle) {
             continue;
         }
 
         // This was constructed from a path, it will never fail.
-        const path = URI.parse(&arena.allocator, entry.key) catch |err| switch (err) {
+        const path = URI.parse(&arena.allocator, entry.key_ptr.*) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => unreachable,
         };
 
-        const new_text = std.fs.cwd().readFileAlloc(gpa, path, std.math.maxInt(usize)) catch |err| switch (err) {
+        const new_text = std.fs.cwd().readFileAllocOptions(gpa, path, std.math.maxInt(usize), null, @alignOf(u8), 0) catch |err| switch (err) {
             error.FileNotFound => {
                 // prepared.store
-                try removals.append(entry.key);
+                try removals.append(entry.key_ptr.*);
                 continue;
             },
             else => |e| return e,
         };
         // Completely replace the whole text of the document
-        gpa.free(entry.value.document.mem);
-        entry.value.document.mem = new_text;
-        entry.value.document.text = new_text;
-        try prepared.store.refreshDocument(entry.value);
+        gpa.free(entry.value_ptr.*.document.mem);
+        entry.value_ptr.*.document.mem = new_text;
+        entry.value_ptr.*.document.text = new_text;
+        try prepared.store.refreshDocument(entry.value_ptr.*);
 
         reloaded += 1;
     }
 
     for (removals.items) |rm| {
         const entry = prepared.store.handles.getEntry(rm).?;
-        entry.value.tree.deinit(gpa);
-        prepared.store.allocator.free(entry.value.document.mem);
+        entry.value_ptr.*.tree.deinit(gpa);
+        prepared.store.allocator.free(entry.value_ptr.*.document.mem);
 
-        for (entry.value.import_uris) |import_uri| {
+        for (entry.value_ptr.*.import_uris) |import_uri| {
             prepared.store.closeDocument(import_uri);
             prepared.store.allocator.free(import_uri);
         }
-        prepared.store.allocator.free(entry.value.import_uris);
-        entry.value.imports_used.deinit(prepared.store.allocator);
-        entry.value.document_scope.deinit(prepared.store.allocator);
-        prepared.store.allocator.destroy(entry.value);
-        const uri_key = entry.key;
-        prepared.store.handles.removeAssertDiscard(rm);
+        prepared.store.allocator.free(entry.value_ptr.*.import_uris);
+        entry.value_ptr.*.imports_used.deinit(prepared.store.allocator);
+        entry.value_ptr.*.document_scope.deinit(prepared.store.allocator);
+        prepared.store.allocator.destroy(entry.value_ptr.*);
+        const uri_key = entry.key_ptr.*;
+        std.debug.assert(prepared.store.handles.remove(rm));
         prepared.store.allocator.free(uri_key);
     }
     std.debug.print("Reloaded {d} of {d} cached documents, removed {d}.\n", .{
@@ -202,7 +202,7 @@ pub fn analyse(arena: *std.heap.ArenaAllocator, prepared: *PrepareResult, line: 
     }
 
     var bound_type_params = analysis.BoundTypeParams.init(&arena.allocator);
-    var tokenizer = std.zig.Tokenizer.init(std.mem.trim(u8, line, "\n \t"));
+    var tokenizer = std.zig.Tokenizer.init(try arena.allocator.dupeZ(u8, std.mem.trim(u8, line, "\n \t")));
     if (try getFieldAccessType(&prepared.store, arena, prepared.root_handle, &tokenizer, &bound_type_params)) |result| {
         if (result.handle != prepared.root_handle) {
             switch (result.decl.*) {
